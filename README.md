@@ -1,4 +1,25 @@
-# EtherCAT CiA402 状态机在线监控脚本
+# EtherCAT CiA402 状态机在线监控诊断器 (EtherCAT CiA402 Monitor)
+
+<p align="left">
+  <img src="https://img.shields.io/badge/Language-C++17-00599C?style=flat-square&logo=c%2B%2B" alt="C++" />
+  <img src="https://img.shields.io/badge/GUI-Qt%206-41CD52?style=flat-square&logo=qt" alt="Qt 6" />
+  <img src="https://img.shields.io/badge/Stack-SOEM-008080?style=flat-square" alt="SOEM" />
+  <img src="https://img.shields.io/badge/Protocol-CiA%20402-blue?style=flat-square" alt="CiA 402" />
+  <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License" />
+  <a href="https://zhuzq2020.github.io"><img src="https://img.shields.io/badge/Technical_Blog-zhuzq2020.github.io-orange?style=flat-square&logo=hexo" alt="Blog" /></a>
+</p>
+
+> 基于 SOEM + Qt 6/C++ 的只读上位机。它从 EtherCAT 从站自带的 SII/CoE 信息扫描设备，无需依赖厂商 ESI XML，通过 SDO 周期读取并解码标准 CiA402 状态机与驱动器核心参数。
+
+```mermaid
+graph LR
+    NIC[物理网卡 NIC] -->|Raw Socket| SOEM[SOEM 协议栈 PRE-OP]
+    SOEM -->|CoE / SDO 只读扫描| OD[对象字典 6041h/6064h/603Fh]
+    OD -->|标准掩码解析| Engine[CiA402 状态机解析核心]
+    Engine -->|Qt 异步信号槽| GUI[Qt 6 实时监控看板]
+```
+
+---
 
 基于 SOEM + Qt 6/C++ 的只读上位机。它从 EtherCAT 从站自带的 SII/CoE 信息扫描设备，不需要 ESI XML，并通过 SDO 周期读取标准 CiA402 对象。SOEM 共享库与所需头文件已放在项目内的 `third_party/soem`，运行和构建都不依赖外部 SOEM 目录。
 
@@ -72,3 +93,12 @@ chmod +x scripts/grant_raw_socket.sh
 ## 设计边界
 
 该工具是通用诊断监控器，不会猜测厂商私有 PDO 映射，也不会自动进入 OP 或改变电机状态。标准 CiA402 对象可通过 CoE 读取时无需 ESI；但如需确定性高频 PDO 监控，仍应根据驱动器手册配置 PDO 映射和实时周期。
+
+## 📖 相关技术博客推荐
+
+- 🌐 [EtherCAT 与 CANopen/CiA 402 伺服控制入门：从 CoE、SDO/PDO 到状态机](https://zhuzq2020.github.io/2026/07/22/EtherCAT-CANopen-CiA402-Servo-Control/)：作者原创长文，深入剖析 CoE、SDO/PDO 映射与 CiA 402 驱动器使能全流程。
+- 🏠 [个人技术博客主页](https://zhuzq2020.github.io)
+
+## 📄 开源许可证
+
+本项目采用 [MIT License](LICENSE) 协议开源。
