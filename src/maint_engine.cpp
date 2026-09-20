@@ -1,0 +1,759 @@
+#include "maint_engine.hpp"
+
+#include <iostream>
+#include <cstring>
+#include <chrono>
+#include <thread>
+#include <cmath>
+#include <algorithm>
+#include <iomanip>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
+
+namespace robot_maint {
+
+std::atomic<bool> MaintEngine::stop_requested_{false};
+
+void MaintEngine::request_stop() noexcept {
+    stop_requested_.store(true);
+}
+
+namespace {
+constexpr std::uint16_t kSiiAliasWord = 0x0004U;
+constexpr std::uint16_t kSiiSizeWord = 0x003eU;
+constexpr std::size_t kSiiHeaderWords = 64;
+// SOEM EEPROM addresses are 16-bit WORD offsets, so the largest addressable
+// image is 65536 words / 128 KiB.
+constexpr std::size_t kMaxSiiBytes = 128U * 1024U;
+
+std::string al_state_str(std::uint16_t state) {
+    switch (state & 0x000fU) {
+        case EC_STATE_NONE: return "NONE";
+        case EC_STATE_INIT: return "INIT";
+        case EC_STATE_PRE_OP: return "PRE-OP";
+        case EC_STATE_BOOT: return "BOOT";
+        case EC_STATE_SAFE_OP: return "SAFE-OP";
+        case EC_STATE_OPERATIONAL: return "OP";
+        default: return "0x" + std::to_string(state);
+    }
+}
+} // namespace
+
+MaintEngine::MaintEngine(std::string iface) : iface_(std::move(iface)) {}
+
+MaintEngine::~MaintEngine() {
+    close();
+}
+
+void MaintEngine::close() {
+    if (initialized_) {
+        ecx_close(&context_);
+        initialized_ = false;
+        slave_count_ = 0;
+    }
+}
+
+bool MaintEngine::init() {
+    close();
+    std::memset(&context_, 0, sizeof(context_));
+
+    if (ecx_init(&context_, iface_.c_str()) <= 0) {
+        std::cerr << "[错误] 无法初始化网络接口: " << iface_ << '\n'
+                  << "       请检查网卡名称是否正确，以及是否具有 root/CAP_NET_RAW 权限。\n";
+        return false;
+    }
+    initialized_ = true;
+
+    // 扫描总线，配置从站至 PRE-OP 状态
+    // FALSE 表示不自动请求映射 PDO，纯 CoE/SDO 模式
+    slave_count_ = ecx_config_init(&context_);
+    if (slave_count_ <= 0) {
+        std::cerr << "[提示] 网口 " << iface_ << " 上未扫描到任何 EtherCAT 从站。\n"
+                  << "       请检查驱动器供电及网线物理连接。\n";
+        close();
+        return false;
+    }
+
+    ecx_readstate(&context_);
+    return true;
+}
+
+std::vector<AxisStatus> MaintEngine::scan_all() {
+    std::vector<AxisStatus> list;
+    if (!initialized_ || slave_count_ <= 0) return list;
+
+    ecx_readstate(&context_);
+    list.reserve(slave_count_);
+
+    for (int i = 1; i <= slave_count_; ++i) {
+        AxisStatus status;
+        status.slave_index = i;
+        status.station_alias = context_.slavelist[i].aliasadr;
+        status.axis_name = slave_to_axis_name(i, slave_count_);
+        status.ethercat_state = al_state_str(context_.slavelist[i].state);
+        status.vendor_id = context_.slavelist[i].eep_man;
+        status.product_code = context_.slavelist[i].eep_id;
+
+        // 如果 EEPROM 未读出厂商，尝试通过标准 CoE 0x1018 读取
+        if (status.vendor_id == 0 && (context_.slavelist[i].mbx_proto & ECT_MBXPROT_COE) != 0) {
+            read_sdo(i, 0x1018, 1, status.vendor_id);
+            read_sdo(i, 0x1018, 2, status.product_code);
+        }
+        status.vendor_name = vendor_id_to_name(status.vendor_id);
+
+        // 仅在支持 CoE 且非离线时读取字典
+        if ((context_.slavelist[i].mbx_proto & ECT_MBXPROT_COE) != 0) {
+            read_sdo(i, SDO_STATUS_WORD, 0, status.status_word);
+            status.is_fault = (status.status_word & 0x0008U) != 0;
+            status.cia402_state = decode_cia402_state(status.status_word);
+
+            read_sdo(i, SDO_ERROR_CODE, 0, status.error_code);
+            status.error_desc = describe_error_code(status.error_code);
+
+            read_sdo(i, SDO_ACTUAL_POSITION, 0, status.actual_position);
+            read_sdo(i, SDO_ACTUAL_VELOCITY, 0, status.actual_velocity);
+        } else {
+            status.cia402_state = "不支持CoE";
+        }
+        list.push_back(status);
+    }
+    return list;
+}
+
+bool MaintEngine::read_position(int slave_index, std::int32_t& pos) {
+    if (!initialized_ || slave_index <= 0 || slave_index > slave_count_) return false;
+    return read_sdo(slave_index, SDO_ACTUAL_POSITION, 0, pos);
+}
+
+bool MaintEngine::write_station_alias(int slave_index, std::uint16_t alias,
+                                      const std::string& backup_path, std::string& detail) {
+    if (!initialized_ || slave_index <= 0 || slave_index > slave_count_) {
+        detail = "从站索引超出范围";
+        return false;
+    }
+    if (alias == 0) {
+        detail = "Alias 0 表示未配置，拒绝写入";
+        return false;
+    }
+    if (backup_path.empty()) {
+        detail = "必须指定 EEPROM 备份路径";
+        return false;
+    }
+
+    auto& slave = context_.slavelist[slave_index];
+    if (slave.eep_man == 0 || slave.eep_id == 0) {
+        detail = "在线从站的 Vendor ID/Product Code 无效，无法安全核验 EEPROM 身份";
+        return false;
+    }
+    if (slave.aliasadr == alias) {
+        detail = "Alias 已是目标值，未执行 EEPROM 写入";
+        return true;
+    }
+    if (slave.aliasadr != 0) {
+        detail = "当前 Alias 非 0，拒绝覆盖已有身份";
+        return false;
+    }
+
+    const std::filesystem::path backup(backup_path);
+    if (std::filesystem::exists(backup)) {
+        detail = "备份文件已存在，拒绝覆盖: " + backup.string();
+        return false;
+    }
+
+    const bool was_pdi_owned = slave.eep_pdi != 0;
+    bool permission_enabled = false;
+    bool master_owned = false;
+    auto restore = [&]() {
+        if (master_owned && was_pdi_owned) {
+            ecx_eeprom2pdi(&context_, static_cast<std::uint16_t>(slave_index));
+        }
+        if (permission_enabled) {
+            const std::uint8_t disable = 0;
+            write_sdo(slave_index, 0x2679, 0, disable);
+        }
+    };
+    auto fail = [&](const std::string& message) {
+        restore();
+        detail = message;
+        return false;
+    };
+
+    // 意优固件需要先通过厂商对象打开 EEPROM 写权限；同川及其他型号
+    // 直接使用标准 EtherCAT EEPROM 控制权切换，不发送厂商私有 SDO。
+    if (slave.eep_man == kEyouVendorId) {
+        if ((slave.mbx_proto & ECT_MBXPROT_COE) == 0) {
+            detail = "意优从站不支持 CoE，无法通过 0x2679 开启 EEPROM 写权限";
+            return false;
+        }
+        const std::uint8_t enable = 1;
+        if (!write_sdo(slave_index, 0x2679, 0, enable)) {
+            detail = "开启意优 EEPROM 修改权限失败 (0x2679=1)";
+            return false;
+        }
+        permission_enabled = true;
+    }
+
+    if (ecx_eeprom2master(&context_, static_cast<std::uint16_t>(slave_index)) <= 0) {
+        return fail("无法将 EEPROM 控制权切换给 EtherCAT 主站");
+    }
+    master_owned = true;
+
+    // EtherCAT SII word 0x3e stores (EEPROM bytes / 128) - 1. Read the
+    // standard 128-byte header first, then back up exactly the declared size.
+    std::vector<std::uint16_t> words(kSiiHeaderWords);
+    for (std::size_t offset = 0; offset < kSiiHeaderWords; ++offset) {
+        const std::uint32_t value = ecx_readeeprom(
+            &context_, static_cast<std::uint16_t>(slave_index),
+            static_cast<std::uint16_t>(offset), EC_TIMEOUTEEP);
+        words[offset] = static_cast<std::uint16_t>(value & 0xffffU);
+    }
+    const std::size_t sii_bytes =
+        (static_cast<std::size_t>(words[kSiiSizeWord]) + 1U) * 128U;
+    if (sii_bytes < kSiiHeaderWords * sizeof(std::uint16_t) ||
+        sii_bytes > kMaxSiiBytes || (sii_bytes % sizeof(std::uint16_t)) != 0) {
+        return fail("SII EEPROM 声明的容量无效，拒绝写入");
+    }
+    const std::size_t sii_words = sii_bytes / sizeof(std::uint16_t);
+    words.resize(sii_words);
+    for (std::size_t offset = kSiiHeaderWords; offset < words.size(); ++offset) {
+        const std::uint32_t value = ecx_readeeprom(
+            &context_, static_cast<std::uint16_t>(slave_index),
+            static_cast<std::uint16_t>(offset), EC_TIMEOUTEEP);
+        words[offset] = static_cast<std::uint16_t>(value & 0xffffU);
+    }
+
+    auto sii_u32 = [&](std::size_t offset) {
+        return static_cast<std::uint32_t>(words[offset])
+             | (static_cast<std::uint32_t>(words[offset + 1]) << 16U);
+    };
+    if (words[kSiiAliasWord] != 0) {
+        return fail("SII EEPROM 中的 Alias 已非 0，拒绝覆盖");
+    }
+    if (sii_u32(ECT_SII_MANUF) != slave.eep_man ||
+        sii_u32(ECT_SII_ID) != slave.eep_id) {
+        return fail("SII EEPROM 身份与在线从站身份不一致");
+    }
+
+    try {
+        if (backup.has_parent_path()) {
+            std::filesystem::create_directories(backup.parent_path());
+        }
+        std::ofstream output(backup, std::ios::binary | std::ios::out);
+        if (!output) return fail("无法创建 EEPROM 备份: " + backup.string());
+        output.write(reinterpret_cast<const char*>(words.data()),
+                     static_cast<std::streamsize>(words.size() * sizeof(words[0])));
+        if (!output) return fail("EEPROM 备份写入不完整");
+    } catch (const std::exception& error) {
+        return fail(std::string("创建 EEPROM 备份失败: ") + error.what());
+    }
+
+    if (ecx_writeeeprom(&context_, static_cast<std::uint16_t>(slave_index),
+                        kSiiAliasWord, alias, EC_TIMEOUTEEP) <= 0) {
+        return fail("写入 SII Alias word 失败；备份已保留在 " + backup.string());
+    }
+    const auto readback = static_cast<std::uint16_t>(ecx_readeeprom(
+        &context_, static_cast<std::uint16_t>(slave_index),
+        kSiiAliasWord, EC_TIMEOUTEEP) & 0xffffU);
+    if (readback != alias) {
+        return fail("Alias 写后回读不一致；请勿继续操作并保留 EEPROM 备份");
+    }
+
+    restore();
+    slave.aliasadr = alias;
+    detail = "EEPROM Alias 写入并回读成功；备份=" + backup.string()
+           + "。请给该从站重新上电后再次运行 status 验证";
+    return true;
+}
+
+bool MaintEngine::clear_fault(int slave_index, std::string& detail) {
+    if (!initialized_ || slave_index <= 0 || slave_index > slave_count_) {
+        detail = "从站索引超出范围";
+        return false;
+    }
+
+    uint16_t status_word = 0;
+    if (!read_sdo(slave_index, SDO_STATUS_WORD, 0, status_word)) {
+        detail = "读取状态字 0x6041 失败";
+        return false;
+    }
+
+    // 检查是否真有故障
+    if ((status_word & 0x0008U) == 0) {
+        char buf[16];
+        std::snprintf(buf, sizeof(buf), "0x%04X", status_word);
+        detail = "当前无故障报警 (状态字: " + std::string(buf) + ")";
+        return true;
+    }
+
+    // 1. 下发控制字 0x0000 保证复位上升沿有效
+    write_sdo(slave_index, SDO_CONTROL_WORD, 0, static_cast<uint16_t>(0x0000U));
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+    // 2. 下发控制字 0x0080 (CiA-402 Fault Reset 上升沿)
+    const uint16_t cmd_reset = 0x0080U;
+    if (!write_sdo(slave_index, SDO_CONTROL_WORD, 0, cmd_reset)) {
+        detail = "向 0x6040 写入 0x0080 失败";
+        return false;
+    }
+
+    // 3. 保持脉冲 50ms
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    // 4. 复位为 0x0006 (Shutdown 进入 Ready to Switch On 就绪态)
+    const uint16_t cmd_ready = 0x0006U;
+    write_sdo(slave_index, SDO_CONTROL_WORD, 0, cmd_ready);
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+    // 5. 再次回读状态字与故障码
+    status_word = 0;
+    read_sdo(slave_index, SDO_STATUS_WORD, 0, status_word);
+    uint16_t err_code = 0;
+    read_sdo(slave_index, SDO_ERROR_CODE, 0, err_code);
+
+    if ((status_word & 0x0008U) == 0) {
+        detail = "故障已成功清除 (当前状态: " + decode_cia402_state(status_word) + ")";
+        return true;
+    } else {
+        char buf[16];
+        std::snprintf(buf, sizeof(buf), "0x%04X", err_code);
+        detail = "清除失败，硬件故障仍未消除 (错误码: " + std::string(buf) + " - " + describe_error_code(err_code) + ")";
+        return false;
+    }
+}
+
+bool MaintEngine::set_zero(int slave_index, std::string& detail) {
+    if (!initialized_ || slave_index <= 0 || slave_index > slave_count_) {
+        detail = "从站索引超出范围";
+        return false;
+    }
+
+    // 安全检查：确认轴处于失能状态
+    uint16_t status_word = 0;
+    if (read_sdo(slave_index, SDO_STATUS_WORD, 0, status_word)) {
+        if ((status_word & 0x006fU) == 0x0027U) {
+            detail = "安全拦截：该轴处于 OperationEnabled (已使能) 状态，禁止在运动使能态标零！";
+            return false;
+        }
+    }
+
+    // 获取该轴电机厂商
+    uint32_t vendor_id = context_.slavelist[slave_index].eep_man;
+    if (vendor_id == 0) {
+        read_sdo(slave_index, 0x1018, 1, vendor_id);
+    }
+
+    if (vendor_id == kEyouVendorId) {
+        // ========== 意优电机 (Eyou) 标零流程 ==========
+        // 1. 切换模式到 Homing Mode (6)
+        const int8_t mode = 6;
+        if (!write_sdo(slave_index, SDO_MODE_OF_OPERATION, 0, mode)) {
+            detail = "意优驱动: 写入回零模式 0x6060:00 = 6 失败";
+            return false;
+        }
+
+        // 2. 发送 0x0010 触发原点设置
+        const uint16_t control = 0x0010U;
+        if (!write_sdo(slave_index, SDO_CONTROL_WORD, 0, control)) {
+            detail = "意优驱动: 写入控制字 0x6040:00 = 0x0010 失败";
+            return false;
+        }
+
+        // 3. 延时 200ms 等待驱动内部设置原点
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+        // 4. 保存参数至 Flash 0x2130:00 = 1
+        const uint8_t save = 1;
+        if (!write_sdo(slave_index, SDO_EYOU_SAVE_FLASH, 0, save)) {
+            detail = "意优驱动: 写入 Flash 保存对象 0x2130:00 = 1 失败";
+            return false;
+        }
+
+        // 5. 切回 CSP 同步位置模式 (8)
+        const int8_t csp_mode = 8;
+        write_sdo(slave_index, SDO_MODE_OF_OPERATION, 0, csp_mode);
+    } else {
+        // ========== 同川电机 (Tongchuan) 及通用兼容标零流程 ==========
+        // 1. 向标零对象 0x3801:00 写入 5
+        const uint16_t cmd_zero = 5U;
+        if (!write_sdo(slave_index, SDO_TONGCHUAN_SET_ZERO, 0, cmd_zero)) {
+            detail = "向标零对象 0x3801:00 写入 5 失败 (厂商: " + vendor_id_to_name(vendor_id) + ")";
+            return false;
+        }
+
+        // 2. 等待驱动内部写入 Flash / EEPROM
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+        // 3. 回读校验 0x3801:00
+        uint16_t readback = 0xFFFFU;
+        if (!read_sdo(slave_index, SDO_TONGCHUAN_SET_ZERO, 0, readback)) {
+            detail = "回读 0x3801:00 失败";
+            return false;
+        }
+
+        if (readback != 0 && readback != 5) {
+            detail = "标零回读校验异常 (预期 0 或 5，实际返回: " + std::to_string(readback) + ")";
+            return false;
+        }
+    }
+
+    // 验证实际脉冲位置是否已成功归为零 (允许微小抖动)
+    int32_t act_pos = 999999;
+    read_sdo(slave_index, SDO_ACTUAL_POSITION, 0, act_pos);
+
+    detail = "标零完成 [" + vendor_id_to_name(vendor_id) + "]！编码器原点已写入，当前位置脉冲: " + std::to_string(act_pos);
+    return true;
+}
+
+bool MaintEngine::get_axis_ratio(int slave_index, double& counts_per_deg) {
+    uint32_t vendor_id = context_.slavelist[slave_index].eep_man;
+    if (vendor_id == 0) {
+        read_sdo(slave_index, 0x1018, 1, vendor_id);
+    }
+
+    if (vendor_id == kEyouVendorId) {
+        // 意优驱动: 尝试读取 0x608F:01 (单圈分辨率) 与 0x6091 (电子齿轮比)
+        uint32_t units = 0;
+        if (!read_sdo(slave_index, SDO_POSITION_UNITS_PER_REV, 1, units) || units == 0) {
+            units = 131072; // 默认 17 位编码器
+        }
+
+        double gear = 121.0; // 意优关节默认减速比 121
+        uint32_t gear_num = 0, gear_den = 0;
+        if (read_sdo(slave_index, SDO_GEAR_RATIO_COE, 1, gear_num) &&
+            read_sdo(slave_index, SDO_GEAR_RATIO_COE, 2, gear_den) &&
+            gear_den > 0 && gear_num > 0) {
+            gear = static_cast<double>(gear_num) / static_cast<double>(gear_den);
+        }
+
+        counts_per_deg = (static_cast<double>(units) * gear) / 360.0;
+        return true;
+    }
+
+    // 同川驱动或默认通用驱动:
+    uint16_t closed_loop = 0;
+    read_sdo(slave_index, SDO_CLOSED_LOOP_TYPE, 0, closed_loop);
+
+    uint16_t gear = 101;
+    if (!read_sdo(slave_index, SDO_GEAR_RATIO, 0, gear) || gear == 0) {
+        gear = 101; // 默认谐波减速比 101
+    }
+
+    if (closed_loop == 1) {
+        uint16_t out_res_div4 = 0;
+        if (read_sdo(slave_index, SDO_OUTPUT_RESOLUTION, 0, out_res_div4) && out_res_div4 > 0) {
+            double total_counts_per_rev = static_cast<double>(out_res_div4) * 4.0;
+            counts_per_deg = total_counts_per_rev / 360.0;
+            return true;
+        }
+    }
+
+    // 默认 17 位电机编码器 131072 counts/rev * 减速比
+    double total_counts_per_rev = 131072.0 * static_cast<double>(gear);
+    counts_per_deg = total_counts_per_rev / 360.0;
+    return true;
+}
+
+bool MaintEngine::jog_axis_deg(int slave_index, double delta_deg, double speed_rpm, std::string& detail) {
+    if (std::abs(delta_deg) < 1e-4) {
+        detail = "点动角度过小 (< 0.0001 deg)";
+        return false;
+    }
+
+    double counts_per_deg = 131072.0 * 101.0 / 360.0;
+    get_axis_ratio(slave_index, counts_per_deg);
+
+    int32_t delta_counts = static_cast<int32_t>(std::llround(delta_deg * counts_per_deg));
+    return jog_axis_counts(slave_index, delta_counts, speed_rpm, detail);
+}
+
+bool MaintEngine::configure_dynamic_pdo(int slave_index) {
+    if (slave_index <= 0 || slave_index > slave_count_) return false;
+
+    // 1. 设置运行模式为 CSP (8) 通过 SDO
+    const int8_t op_mode = 8;
+    write_sdo(slave_index, SDO_MODE_OF_OPERATION, 0, op_mode);
+
+    // 2. 清除 SM2 分配 (0x1C12:00 = 0)
+    const uint8_t zero8 = 0;
+    if (!write_sdo(slave_index, 0x1C12, 0, zero8)) {
+        // 如果驱动器不支持动态修改 0x1C12，说明该驱动为固定 PDO 映射，保留其默认配置
+        return false;
+    }
+
+    // 3. 配置 RxPDO 0x1600 (动态映射 3 个核心字段: Controlword, Target Pos, Mode)
+    // 0x1600:00 = 0 (禁用映射以允许修改)
+    write_sdo(slave_index, 0x1600, 0, zero8);
+    // 0x1600:01 = 0x60400010 (Controlword, 16 bits)
+    const uint32_t map_cw = 0x60400010U;
+    write_sdo(slave_index, 0x1600, 1, map_cw);
+    // 0x1600:02 = 0x607A0020 (Target Position, 32 bits)
+    const uint32_t map_tp = 0x607A0020U;
+    write_sdo(slave_index, 0x1600, 2, map_tp);
+    // 0x1600:03 = 0x60600008 (Modes of Operation, 8 bits)
+    const uint32_t map_mode = 0x60600008U;
+    write_sdo(slave_index, 0x1600, 3, map_mode);
+    // 0x1600:00 = 3 (激活映射条目数)
+    const uint8_t rx_count = 3;
+    write_sdo(slave_index, 0x1600, 0, rx_count);
+
+    // 将 0x1600 挂载到 SM2 (0x1C12:01 = 0x1600, 0x1C12:00 = 1)
+    const uint16_t rx_pdo_idx = 0x1600U;
+    write_sdo(slave_index, 0x1C12, 1, rx_pdo_idx);
+    const uint8_t one8 = 1;
+    write_sdo(slave_index, 0x1C12, 0, one8);
+
+    // 4. 清除 SM3 分配 (0x1C13:00 = 0)
+    write_sdo(slave_index, 0x1C13, 0, zero8);
+
+    // 5. 配置 TxPDO 0x1A00 (动态映射 2 个核心字段: Statusword, Actual Pos)
+    // 0x1A00:00 = 0 (禁用映射以允许修改)
+    write_sdo(slave_index, 0x1A00, 0, zero8);
+    // 0x1A00:01 = 0x60410010 (Statusword, 16 bits)
+    const uint32_t map_sw = 0x60410010U;
+    write_sdo(slave_index, 0x1A00, 1, map_sw);
+    // 0x1A00:02 = 0x60640020 (Actual Position, 32 bits)
+    const uint32_t map_ap = 0x60640020U;
+    write_sdo(slave_index, 0x1A00, 2, map_ap);
+    // 0x1A00:00 = 2 (激活映射条目数)
+    const uint8_t tx_count = 2;
+    write_sdo(slave_index, 0x1A00, 0, tx_count);
+
+    // 将 0x1A00 挂载到 SM3 (0x1C13:01 = 0x1A00, 0x1C13:00 = 1)
+    const uint16_t tx_pdo_idx = 0x1A00U;
+    write_sdo(slave_index, 0x1C13, 1, tx_pdo_idx);
+    write_sdo(slave_index, 0x1C13, 0, one8);
+
+    return true;
+}
+
+bool MaintEngine::jog_axis_counts(int slave_index, std::int32_t delta_counts, double speed_rpm, std::string& detail) {
+    if (!initialized_ || slave_index <= 0 || slave_index > slave_count_) {
+        detail = "从站索引超出范围";
+        return false;
+    }
+
+    if (delta_counts == 0) {
+        detail = "点动位移脉冲为 0";
+        return false;
+    }
+
+    // 1. 转速安全限幅 (输出端转速限制在 0.05 ~ 2.0 RPM)
+    speed_rpm = std::clamp(speed_rpm, 0.05, 2.0);
+
+    // 2. 先在 PRE-OP 下通过 SDO 检查该轴状态，若有报警先提示清错
+    uint16_t pre_status = 0;
+    read_sdo(slave_index, SDO_STATUS_WORD, 0, pre_status);
+    if ((pre_status & 0x0008U) != 0) {
+        uint16_t err_code = 0;
+        read_sdo(slave_index, SDO_ERROR_CODE, 0, err_code);
+        detail = "该轴处于故障报警状态 (0x" + std::to_string(err_code) + ")，请先执行 clear-fault 清错！";
+        return false;
+    }
+
+    // 3. 配置动态最小化 PDO 映射并进入 SAFE-OP / OP 状态
+    // 对所有从站尝试动态配置仅含核心字段的 PDO (7 字节 Rx / 6 字节 Tx)
+    // 若电机不支持动态 PDO (固定 PDO)，则自动降级使用电机出厂默认映射
+    for (int s = 1; s <= slave_count_; ++s) {
+        configure_dynamic_pdo(s);
+    }
+
+    std::memset(iomap_, 0, sizeof(iomap_));
+    int mapped_size = ecx_config_map_group(&context_, iomap_, 0);
+    if (mapped_size <= 0) {
+        detail = "SOEM PDO 映射失败 (config_map_group 返回 0)";
+        return false;
+    }
+
+    // 等待所有从站达到 SAFE-OP
+    ecx_statecheck(&context_, 0, EC_STATE_SAFE_OP, EC_TIMEOUTSTATE * 2);
+
+    // 发送初次过程数据，使从站能平稳切入 OP
+    ecx_send_processdata(&context_);
+    ecx_receive_processdata(&context_, EC_TIMEOUTRXM);
+
+    // 请求进入 OP 状态
+    context_.slavelist[0].state = EC_STATE_OPERATIONAL;
+    ecx_writestate(&context_, 0);
+
+    int op_check = 0;
+    do {
+        ecx_send_processdata(&context_);
+        ecx_receive_processdata(&context_, EC_TIMEOUTRXM);
+        ecx_statecheck(&context_, slave_index, EC_STATE_OPERATIONAL, 50000);
+    } while (op_check++ < 40 && context_.slavelist[slave_index].state != EC_STATE_OPERATIONAL);
+
+    if (context_.slavelist[slave_index].state != EC_STATE_OPERATIONAL) {
+        detail = "从站未能成功进入 OP 运行状态 (当前: " + al_state_str(context_.slavelist[slave_index].state) + ")";
+        context_.slavelist[0].state = EC_STATE_PRE_OP;
+        ecx_writestate(&context_, 0);
+        return false;
+    }
+
+    // 获取当前轴的 PDO 内存指针及配置大小
+    uint8_t* out_ptr = context_.slavelist[slave_index].outputs;
+    uint8_t* in_ptr = context_.slavelist[slave_index].inputs;
+    const int obytes = context_.slavelist[slave_index].Obytes;
+    const int ibytes = context_.slavelist[slave_index].Ibytes;
+
+    if (!out_ptr || !in_ptr || obytes < 6 || ibytes < 6) {
+        detail = "未获取到有效的 PDO 输入/输出内存指针 (Obytes: " + std::to_string(obytes) + ", Ibytes: " + std::to_string(ibytes) + ")";
+        context_.slavelist[0].state = EC_STATE_PRE_OP;
+        ecx_writestate(&context_, 0);
+        return false;
+    }
+
+    // 自适应确定模式字节偏移量:
+    // 动态极简映射: 7 字节 (CW: 0..1, Pos: 2..5, Mode: 6) -> mode_offset = 6
+    // 同川默认固定映射: 17 字节 (CW: 0..1, Pos: 2..5, ..., Mode: 16) -> mode_offset = 16
+    // 其它驱动器若无 Mode 映射，则 mode_offset = -1 (已在 PRE-OP 下通过 SDO 0x6060 预置 CSP)
+    int mode_offset = -1;
+    if (obytes == 7) {
+        mode_offset = 6;
+    } else if (obytes >= 17) {
+        mode_offset = 16;
+    }
+
+    // 辅助读写 PDO
+    auto get_in_status = [&]() -> uint16_t {
+        uint16_t sw = 0;
+        if (in_ptr && ibytes >= 2) {
+            std::memcpy(&sw, in_ptr, 2);
+        }
+        return sw;
+    };
+    auto get_in_pos = [&]() -> int32_t {
+        int32_t p = 0;
+        if (in_ptr && ibytes >= 6) {
+            std::memcpy(&p, in_ptr + 2, 4);
+        }
+        return p;
+    };
+    auto set_out = [&](uint16_t cw, int32_t target_p, int8_t mode = 8) {
+        if (!out_ptr) return;
+        if (obytes >= 2) {
+            std::memcpy(out_ptr, &cw, 2);
+        }
+        if (obytes >= 6) {
+            std::memcpy(out_ptr + 2, &target_p, 4);
+        }
+        if (mode_offset >= 0 && mode_offset < obytes) {
+            out_ptr[mode_offset] = static_cast<uint8_t>(mode); // Mode 8: CSP
+        }
+    };
+
+    // 读取当前实际脉冲作为基准位置
+    ecx_send_processdata(&context_);
+    ecx_receive_processdata(&context_, EC_TIMEOUTRXM);
+    int32_t start_pos = get_in_pos();
+    int32_t current_cmd = start_pos;
+
+    // 4. 驱动器伺服使能握手 (CiA-402 状态推进)
+    stop_requested_.store(false);
+
+    // Step A: 发送 0x0006 (Shutdown / Ready to Switch On)
+    bool enabled = false;
+    for (int step = 0; step < 100 && !stop_requested_.load(); ++step) {
+        set_out(0x0006, start_pos, 8);
+        ecx_send_processdata(&context_);
+        ecx_receive_processdata(&context_, EC_TIMEOUTRXM);
+        uint16_t sw = get_in_status();
+        if ((sw & 0x006fU) == 0x0021U || (sw & 0x006fU) == 0x0023U) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+
+    // Step B: 发送 0x000f (Switch On + Enable Operation)
+    for (int step = 0; step < 200 && !stop_requested_.load(); ++step) {
+        set_out(0x000f, start_pos, 8);
+        ecx_send_processdata(&context_);
+        ecx_receive_processdata(&context_, EC_TIMEOUTRXM);
+        uint16_t sw = get_in_status();
+        if ((sw & 0x006fU) == 0x0027U) {
+            enabled = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+
+    if (!enabled || stop_requested_.load()) {
+        set_out(0x0006, start_pos, 8);
+        ecx_send_processdata(&context_);
+        context_.slavelist[0].state = EC_STATE_PRE_OP;
+        ecx_writestate(&context_, 0);
+        detail = "驱动器使能握手超时或被手动取消";
+        return false;
+    }
+
+    // 5. 计算点动运行总时长与 2ms 周期循环参数
+    double counts_per_rev = 131072.0 * 101.0;
+    double counts_per_deg = counts_per_rev / 360.0;
+    get_axis_ratio(slave_index, counts_per_deg);
+    counts_per_rev = counts_per_deg * 360.0;
+
+    double revs = std::abs(static_cast<double>(delta_counts)) / counts_per_rev;
+    double duration_s = (revs / speed_rpm) * 60.0;
+    if (duration_s < 1.0) duration_s = 1.0; // 最小平滑时间 1.0 秒，确保平稳起停
+
+    constexpr int cycle_us = 2000; // 2ms 控制周期
+    const int total_cycles = static_cast<int>(duration_s * 1000000.0 / cycle_us);
+
+    std::cout << "  [JOG 启动] 目标增量: " << delta_counts << " counts ("
+              << std::fixed << std::setprecision(2) << (delta_counts / counts_per_deg) << " deg), "
+              << "规划时长: " << std::setprecision(2) << duration_s << " s, 输出转速: " << speed_rpm << " RPM\n";
+
+    // 6. 执行 2ms 周期 CSP 平滑插值循环
+    auto next_time = std::chrono::steady_clock::now();
+    bool completed = true;
+
+    for (int c = 1; c <= total_cycles; ++c) {
+        if (stop_requested_.load()) {
+            completed = false;
+            std::cout << "\n  [JOG 中断] 收到停止信号 (Ctrl+C)，安全停机抱闸...\n";
+            break;
+        }
+
+        double t = static_cast<double>(c) / total_cycles;
+        double s = smoothstep5(t);
+        current_cmd = start_pos + static_cast<int32_t>(std::llround(delta_counts * s));
+
+        set_out(0x000f, current_cmd, 8);
+        ecx_send_processdata(&context_);
+        ecx_receive_processdata(&context_, EC_TIMEOUTRXM);
+
+        next_time += std::chrono::microseconds(cycle_us);
+        std::this_thread::sleep_until(next_time);
+    }
+
+    // 7. 到位后保持当前终点 200ms
+    int32_t final_hold = current_cmd;
+    for (int h = 0; h < 100; ++h) {
+        set_out(0x000f, final_hold, 8);
+        ecx_send_processdata(&context_);
+        ecx_receive_processdata(&context_, EC_TIMEOUTRXM);
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+
+    // 8. 安全脱使能下电 (下发 0x0006 抱闸锁死)
+    for (int d = 0; d < 50; ++d) {
+        set_out(0x0006, final_hold, 8);
+        ecx_send_processdata(&context_);
+        ecx_receive_processdata(&context_, EC_TIMEOUTRXM);
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+
+    // 9. 从站切回 PRE-OP 状态以确保后续 SDO 纯维护命令无缝工作
+    context_.slavelist[0].state = EC_STATE_PRE_OP;
+    ecx_writestate(&context_, 0);
+    ecx_statecheck(&context_, 0, EC_STATE_PRE_OP, EC_TIMEOUTSTATE);
+
+    int32_t final_actual = get_in_pos();
+    detail = "点动结束！实际运动: " + std::to_string(final_actual - start_pos) + " counts ("
+           + std::to_string((final_actual - start_pos) / counts_per_deg) + " deg), 当前绝对位置: "
+           + std::to_string(final_actual);
+
+    return completed;
+}
+
+} // namespace robot_maint

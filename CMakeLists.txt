@@ -1,63 +1,61 @@
-cmake_minimum_required(VERSION 3.28)
-
-project(EtherCATCiA402Monitor VERSION 1.0.0 LANGUAGES C CXX)
+cmake_minimum_required(VERSION 3.16)
+project(arm_maint_tool C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_C_STANDARD 99)
 
-option(BUILD_GUI "Build the Qt 6 monitoring application" ON)
-option(BUILD_TESTING "Build unit tests" ON)
+# 编译优化
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE RelWithDebInfo)
+endif()
 
-add_library(cia402_state STATIC
-    src/Cia402State.cpp
+# SOEM 源码目录
+set(SOEM_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/soem")
+
+set(SOEM_SOURCES
+    "${SOEM_DIR}/src/ec_base.c"
+    "${SOEM_DIR}/src/ec_coe.c"
+    "${SOEM_DIR}/src/ec_config.c"
+    "${SOEM_DIR}/src/ec_dc.c"
+    "${SOEM_DIR}/src/ec_eoe.c"
+    "${SOEM_DIR}/src/ec_foe.c"
+    "${SOEM_DIR}/src/ec_main.c"
+    "${SOEM_DIR}/src/ec_print.c"
+    "${SOEM_DIR}/src/ec_soe.c"
+    "${SOEM_DIR}/osal/linux/osal.c"
+    "${SOEM_DIR}/oshw/linux/nicdrv.c"
+    "${SOEM_DIR}/oshw/linux/oshw.c"
 )
-target_include_directories(cia402_state PUBLIC src)
 
-if(BUILD_GUI)
-    find_package(Qt6 6.2 REQUIRED COMPONENTS Core Widgets)
+# 静态库目标
+add_library(soem_static STATIC ${SOEM_SOURCES})
 
-    set(SOEM_BUNDLE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/soem")
-    set(SOEM_LIBRARY "${SOEM_BUNDLE_DIR}/lib/libsoem.so")
-    set(SOEM_INCLUDE_DIR "${SOEM_BUNDLE_DIR}/include")
-    if(NOT EXISTS "${SOEM_LIBRARY}" OR NOT EXISTS "${SOEM_INCLUDE_DIR}/soem/soem.h")
-        message(FATAL_ERROR "Bundled SOEM library or headers are missing from third_party/soem")
-    endif()
+target_include_directories(soem_static PUBLIC
+    "${SOEM_DIR}/include"
+    "${SOEM_DIR}/osal"
+    "${SOEM_DIR}/osal/linux"
+    "${SOEM_DIR}/oshw/linux"
+)
 
-    add_library(soem SHARED IMPORTED GLOBAL)
-    set_target_properties(soem PROPERTIES
-        IMPORTED_LOCATION "${SOEM_LIBRARY}"
-        INTERFACE_INCLUDE_DIRECTORIES "${SOEM_INCLUDE_DIR}"
-    )
+# 编译单一二进制维护工具
+add_executable(arm_maint
+    src/main.cpp
+    src/maint_engine.cpp
+)
 
-    set(CMAKE_AUTOMOC ON)
-    qt_add_executable(ethercat_cia402_monitor
-        src/main.cpp
-        src/MainWindow.h
-        src/MainWindow.cpp
-        src/EthercatWorker.h
-        src/EthercatWorker.cpp
-        src/Models.h
-    )
-    target_link_libraries(ethercat_cia402_monitor PRIVATE
-        Qt6::Core
-        Qt6::Widgets
-        cia402_state
-        soem
-    )
-    target_compile_options(ethercat_cia402_monitor PRIVATE -Wall -Wextra -Wpedantic)
-    set_target_properties(ethercat_cia402_monitor PROPERTIES
-        BUILD_RPATH "\$ORIGIN/../third_party/soem/lib"
-        INSTALL_RPATH "\$ORIGIN/../lib"
-    )
+target_include_directories(arm_maint PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/include"
+    "${SOEM_DIR}/include"
+    "${SOEM_DIR}/osal"
+    "${SOEM_DIR}/osal/linux"
+    "${SOEM_DIR}/oshw/linux"
+)
 
-    install(TARGETS ethercat_cia402_monitor RUNTIME DESTINATION bin)
-    install(FILES "${SOEM_LIBRARY}" DESTINATION lib)
-endif()
+target_link_libraries(arm_maint PRIVATE
+    soem_static
+    pthread
+)
 
-if(BUILD_TESTING)
-    enable_testing()
-    add_executable(cia402_state_test tests/Cia402StateTest.cpp)
-    target_link_libraries(cia402_state_test PRIVATE cia402_state)
-    add_test(NAME cia402_state_test COMMAND cia402_state_test)
-endif()
+# 安装规则
+install(TARGETS arm_maint DESTINATION bin)

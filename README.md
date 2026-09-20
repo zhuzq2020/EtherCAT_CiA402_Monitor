@@ -1,104 +1,102 @@
-# EtherCAT CiA402 状态机在线监控诊断器 (EtherCAT CiA402 Monitor)
+# 机械臂现场维护与零点标定工具 (arm_maint)
 
-<p align="left">
-  <img src="https://img.shields.io/badge/Language-C++17-00599C?style=flat-square&logo=c%2B%2B" alt="C++" />
-  <img src="https://img.shields.io/badge/GUI-Qt%206-41CD52?style=flat-square&logo=qt" alt="Qt 6" />
-  <img src="https://img.shields.io/badge/Stack-SOEM-008080?style=flat-square" alt="SOEM" />
-  <img src="https://img.shields.io/badge/Protocol-CiA%20402-blue?style=flat-square" alt="CiA 402" />
-  <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License" />
-  <a href="https://zhuzq2020.github.io"><img src="https://img.shields.io/badge/Technical_Blog-zhuzq2020.github.io-orange?style=flat-square&logo=hexo" alt="Blog" /></a>
-</p>
+专为现场售后、维护、装配人员打造的轻量级 EtherCAT 机械臂维护工具。
 
-> 基于 SOEM + Qt 6/C++ 的只读上位机。它从 EtherCAT 从站自带的 SII/CoE 信息扫描设备，无需依赖厂商 ESI XML，通过 SDO 周期读取并解码标准 CiA402 状态机与驱动器核心参数。
+## 特性亮点
 
-```mermaid
-graph LR
-    NIC[物理网卡 NIC] -->|Raw Socket| SOEM[SOEM 协议栈 PRE-OP]
-    SOEM -->|CoE / SDO 只读扫描| OD[对象字典 6041h/6064h/603Fh]
-    OD -->|标准掩码解析| Engine[CiA402 状态机解析核心]
-    Engine -->|Qt 异步信号槽| GUI[Qt 6 实时监控看板]
+- **零内核模块依赖**：基于纯用户态 SOEM 协议栈，通过 Linux 原生 Raw Socket 访问网卡，**无需加载 `ec_master.ko` 等内核驱动**，升级内核绝不崩溃。
+- **零外部动态库依赖**：项目内置 SOEM 源码静态打包，生成单一小巧二进制（< 400KB），无需安装系统依赖。
+- **纯 SDO 安全交互**：仅初始化至 PRE-OP 状态，杜绝任何电机误动飞车风险。
+- **核心功能**：
+  1. `status`：查看从站拓扑、CiA-402状态、故障码、实际脉冲；
+  2. `clear-fault`：单轴 / 全轴清除故障报警；
+  3. `set-zero`：单轴 / 全轴标定绝对值编码器零位（同川 0x3801 协议，强制 `--confirm` 防误触）；
+  4. `read-pos`：快速读取当前编码器脉冲。
+  5. `write-alias`：备份 SII EEPROM 后，为任意厂商的 Hot Connect 组首写入 Station Alias。
+
+## 从站 ID、D18 与 Alias
+
+- **从站 ID** 是主站每次扫描总线得到的临时顺序号，取决于当时的物理拓扑，不是电机铭牌身份。
+- **D18** 是机器人配置里的逻辑关节名。本工具在单独连接右臂 7 轴时，按拓扑顺序显示 D18～D24；这不代表该字符串存储在每台电机中。
+- **Station Alias** 位于 EtherCAT 从站 SII EEPROM。全新电机通常为 0，不会天然带 D18。整机 Hot Connect 方案只给每条链的组首写 Alias：右臂组首 D18 写 18，D19～D24 不需要依次写 19～24。
+
+---
+
+## 快速编译
+
+在 Linux 工控机或笔记本上执行：
+
+```bash
+chmod +x scripts/*.sh
+./scripts/build.sh
+```
+
+如需免 `sudo` 运行：
+```bash
+./scripts/grant_cap.sh
 ```
 
 ---
 
-基于 SOEM + Qt 6/C++ 的只读上位机。它从 EtherCAT 从站自带的 SII/CoE 信息扫描设备，不需要 ESI XML，并通过 SDO 周期读取标准 CiA402 对象。SOEM 共享库与所需头文件已放在项目内的 `third_party/soem`，运行和构建都不依赖外部 SOEM 目录。
+## 常用维护命令指南
 
-## 功能
-
-- 枚举本机网卡并扫描 EtherCAT 从站，显示 Vendor ID、Product Code、Revision、CoE/DC 能力。
-- 自动读取状态字 `6041h`、控制字 `6040h`、运行模式 `6060h/6061h`、位置 `6064h`、速度 `606Ch`、转矩 `6077h`、错误码 `603Fh` 和错误寄存器 `1001h`。
-- 按 IEC 61800-7 / CiA402 状态字遮码解析 8 种标准状态。
-- 读取工作在 Qt 后台线程，界面可调刷新周期。
-- 内置无硬件演示模式，可先验证 UI 与状态告警。
-- 默认严格只读：不写 `6040h`，不切换模式，不使能或驱动电机。
-
-## Ubuntu 22.04 依赖
-
+### 1. 扫描总线与查看健康状态
 ```bash
-sudo apt update
-sudo apt install -y build-essential qt6-base-dev libgl1-mesa-dev libcap2-bin
+sudo ./build/arm_maint status
+# 或指定网卡名:
+sudo ./build/arm_maint status -i enp2s0
 ```
 
-项目已内置为当前 Linux x86_64 主机构建的 SOEM 2.0 共享库，不再需要 `/home/admin1/workspace/SOEM`。
-
-## 构建
-
+### 2. 清除驱动器故障报警
 ```bash
-cd /home/admin1/workspace/EtherCAT_CiA402_Monitor
-cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-  -DCMAKE_PREFIX_PATH="$PWD/.deps/qt6/usr"
-cmake --build build -j"$(nproc)"
-ctest --test-dir build --output-on-failure
+# 单轴清错 (例如 D18 轴过流报警):
+sudo ./build/arm_maint clear-fault --axis D18
+
+# 整臂所有轴一键清错:
+sudo ./build/arm_maint clear-fault --axis D18 --all
 ```
 
-Qt6 未安装时，仍可单独构建和测试 CiA402 解析核心：
+### 3. 点动微调 (JOG) 慢速转动对齐机械刻线
+> 💡 **安全机制**：基于轻量受控 CSP 模式，带 5 次多项式平滑起停，输出转速严格限幅在安全低速（默认 0.5 RPM），运行中支持 `Ctrl+C` 立即减速抱闸。
 
 ```bash
-cmake -S . -B build-core -DBUILD_GUI=OFF
-cmake --build build-core -j"$(nproc)"
-ctest --test-dir build-core --output-on-failure
+# 单轴按度数微调 (例如 D18 轴微调转动 +1.0 度):
+sudo ./build/arm_maint jog --axis D18 --delta_deg 1.0
+
+# 单轴反向微调 (例如 D20 轴反转 -0.5 度，速度 0.3 RPM):
+sudo ./build/arm_maint jog --axis D20 --delta_deg -0.5 --speed_rpm 0.3
+
+# 单轴按脉冲数精确微调 (例如微调 +5000 counts):
+sudo ./build/arm_maint jog --axis D18 --delta_count 5000
 ```
 
-如果当前账号没有 `sudo` 权限，也可将 Ubuntu 的 Qt6 包解压到项目内（不修改系统）：
+### 4. 标定零点 (绝对值编码器原点校准)
+> ⚠️ **注意**：标零操作会将当前物理姿态永久保存进编码器存储芯片。必须在机械臂处于机械对准工装刻度位置时执行，并追加 `--confirm` 确认。
 
 ```bash
-chmod +x scripts/bootstrap_qt6_local.sh scripts/run.sh
-./scripts/bootstrap_qt6_local.sh
-cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-  -DCMAKE_PREFIX_PATH="$PWD/.deps/qt6/usr"
-cmake --build build -j"$(nproc)"
-./scripts/run.sh
+# 单轴标零 (更换了 D20 关节电机后的独立标定):
+sudo ./build/arm_maint set-zero --axis D20 --confirm
+
+# 整臂所有 7 轴一次性标零:
+sudo ./build/arm_maint set-zero --all --confirm
 ```
 
-## 运行权限
+### 5. 辅助读取实际位置
+```bash
+# 查看全臂各关节当前实际编码器计数:
+sudo ./build/arm_maint read-pos
+```
 
-SOEM 需要打开 raw Ethernet socket。推荐只给编译产物授予所需 capability，不要长期以 root 运行 GUI：
+### 6. 写入右臂组首 D18 的 Station Alias
+
+先运行 `status`，确认目标电机确实是物理从站 1 且当前 Alias 为 0。写入会按 SII 容量字段备份完整 EEPROM，并核对备份中的 Vendor ID/Product Code 与在线身份一致；备份路径必须不存在。意优型号会自动通过厂商对象 `0x2679` 临时打开写权限，同川和其他型号使用标准 EtherCAT EEPROM 写入流程。
 
 ```bash
-cd /home/admin1/workspace/EtherCAT_CiA402_Monitor
-chmod +x scripts/grant_raw_socket.sh
-./scripts/grant_raw_socket.sh
-./build/ethercat_cia402_monitor
+sudo ./build/arm_maint status -i enp2s0
+sudo ./build/arm_maint write-alias -i enp2s0 \
+  --slave 1 --alias 18 \
+  --backup ./backups/d18-sii-before-alias.bin \
+  --confirm WRITE-EEPROM-ALIAS
 ```
 
-每次重新链接/替换可执行文件后，需要重新执行 capability 脚本。
-
-## 使用说明
-
-1. EtherCAT 专用网卡应直连从站，并避免 NetworkManager/DHCP 同时使用该网卡。
-2. 打开程序后选择网卡，点击“扫描并监控”。程序会保持从站在 SOEM 扫描后的 PRE-OP 状态，通过 CoE/SDO 只读标准对象。
-3. 若某个值显示 `—` 或“不支持/读取失败”，表示该从站未暴露对应对象、不支持 CoE，或当前状态不允许读取。
-4. 多从站时，SDO 读取是顺序执行的。若从站较多，建议将刷新周期设为 1000–2000 ms，避免邮箱通信负载过高。
-
-## 设计边界
-
-该工具是通用诊断监控器，不会猜测厂商私有 PDO 映射，也不会自动进入 OP 或改变电机状态。标准 CiA402 对象可通过 CoE 读取时无需 ESI；但如需确定性高频 PDO 监控，仍应根据驱动器手册配置 PDO 映射和实时周期。
-
-## 📖 相关技术博客推荐
-
-- 🌐 [EtherCAT 与 CANopen/CiA 402 伺服控制入门：从 CoE、SDO/PDO 到状态机](https://zhuzq2020.github.io/2026/07/22/EtherCAT-CANopen-CiA402-Servo-Control/)：作者原创长文，深入剖析 CoE、SDO/PDO 映射与 CiA 402 驱动器使能全流程。
-- 🏠 [个人技术博客主页](https://zhuzq2020.github.io)
-
-## 📄 开源许可证
-
-本项目采用 [MIT License](LICENSE) 协议开源。
+成功后给该从站重新上电，再运行 `status`，确认 Alias 显示为 18。工具拒绝覆盖非零 Alias，也不会自动写 D19～D24。
