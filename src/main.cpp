@@ -6,11 +6,54 @@
 #include <string>
 #include <vector>
 #include <csignal>
+#include <cstdint>
+#include <cstring>
+#include <sstream>
 
 namespace {
 
 void sigint_handler(int) {
     robot_maint::MaintEngine::request_stop();
+}
+
+bool parse_object_address(const std::string& text, unsigned max, unsigned& result) {
+    if (text.empty() || text[0] == '-' || text[0] == '+') return false;
+    try {
+        std::size_t end = 0;
+        const int base = text.size() > 2 && text[0] == '0' &&
+                         (text[1] == 'x' || text[1] == 'X') ? 16 : 10;
+        const auto parsed = std::stoul(text, &end, base);
+        if (end != text.size() || parsed > max) return false;
+        result = static_cast<unsigned>(parsed);
+        return true;
+    } catch (const std::exception&) {
+        return false;
+    }
+}
+
+std::string format_sdo_value(const std::vector<std::uint8_t>& bytes) {
+    std::ostringstream out;
+    out << "长度 " << bytes.size() << " 字节, 原始字节 (低位在前):";
+    for (const auto byte : bytes) {
+        out << ' ' << std::hex << std::setw(2) << std::setfill('0')
+            << static_cast<unsigned>(byte);
+    }
+    if (bytes.size() == 1 || bytes.size() == 2 || bytes.size() == 4 || bytes.size() == 8) {
+        std::uint64_t number = 0;
+        for (std::size_t i = 0; i < bytes.size(); ++i) {
+            number |= static_cast<std::uint64_t>(bytes[i]) << (8 * i);
+        }
+        const unsigned bits = static_cast<unsigned>(bytes.size() * 8);
+        if ((number & (std::uint64_t{1} << (bits - 1))) != 0 && bits < 64) {
+            number |= ~std::uint64_t{0} << bits;
+        }
+        std::int64_t signed_number = 0;
+        std::memcpy(&signed_number, &number, sizeof(number));
+        const std::uint64_t unsigned_number = bits == 64
+            ? number : number & ((std::uint64_t{1} << bits) - 1);
+        out << std::dec << ", 无符号: " << unsigned_number << ", 有符号: " << signed_number;
+    }
+    return out.str();
 }
 
 void show_help() {
@@ -40,7 +83,11 @@ void show_help() {
               << "  5. read-pos           快速读取单轴或全臂当前编码器实际脉冲位置\n"
               << "       --axis <Dxx|1..N>  读取指定轴\n"
               << "       --all              读取全部轴\n"
-              << "  6. write-alias        将 Hot Connect 组首 Alias 写入从站 SII EEPROM（支持同川/意优/其他型号）\n"
+              << "  6. read-sdo           读取指定 CoE 对象，默认读取全部从站\n"
+              << "       --index <0xHHHH>   对象索引（必填，如 0x6064）\n"
+              << "       --subindex <0..255> 子索引（默认 0，也可用 0x 格式）\n"
+              << "       --axis <Dxx|1..N>  读取指定轴；--all 读取全部轴\n"
+              << "  7. write-alias        将 Hot Connect 组首 Alias 写入从站 SII EEPROM（支持同川/意优/其他型号）\n"
               << "       --slave <1..N>     按本次扫描序号选择物理从站（不接受 Dxx，防止混淆）\n"
               << "       --alias <1..65535> 要写入的 Alias（右臂组首 D18 为 18）\n"
               << "       --backup <FILE>    按 SII 声明容量保存完整 EEPROM 备份（不得已存在）\n"
@@ -54,6 +101,8 @@ void show_help() {
               << "  sudo ./arm_maint jog --axis D20 --delta_deg -0.5 --speed_rpm 0.3\n"
               << "  # 对齐刻线后执行绝对零点标定 (自动识别同川或意优驱动):\n"
               << "  sudo ./arm_maint set-zero --axis D18 --confirm\n"
+              << "  sudo ./arm_maint read-sdo --axis D18 --index 0x6064\n"
+              << "  sudo ./arm_maint read-sdo --axis 1 --index 0x1018 --subindex 1\n"
               << "  # 仅为右臂链头（扫描从站 1）写入 D18 Hot Connect Alias:\n"
               << "  sudo ./arm_maint write-alias --slave 1 --alias 18 --backup ./d18-sii.bin --confirm WRITE-EEPROM-ALIAS\n\n";
 }
@@ -82,6 +131,9 @@ int main(int argc, char** argv) {
     int32_t delta_count = 0;
     bool has_delta_count = false;
     double speed_rpm = 0.5;
+    unsigned sdo_index = 0;
+    unsigned sdo_subindex = 0;
+    bool has_sdo_index = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -92,6 +144,15 @@ int main(int argc, char** argv) {
             if (++i < argc) iface = argv[i];
         } else if (arg == "--axis") {
             if (++i < argc) target_axis = argv[i];
+        } else if (arg == "--index" || arg == "--subindex") {
+            const bool is_index = arg == "--index";
+            unsigned parsed = 0;
+            if (++i >= argc || !parse_object_address(argv[i], is_index ? 0xffffU : 0xffU, parsed)) {
+                std::cerr << "[错误] " << arg << " 必须是有效的十进制或 0x 十六进制数。\n";
+                return 1;
+            }
+            if (is_index) { sdo_index = parsed; has_sdo_index = true; }
+            else sdo_subindex = parsed;
         } else if (arg == "--all") {
             all_axes = true;
         } else if (arg == "--confirm") {
@@ -121,7 +182,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    if (command != "status" && command != "clear-fault" && command != "set-zero" && command != "read-pos" && command != "jog" && command != "write-alias") {
+    if (command != "status" && command != "clear-fault" && command != "set-zero" && command != "read-pos" && command != "read-sdo" && command != "jog" && command != "write-alias") {
         std::cerr << "[错误] 未知命令: " << command << "，输入 --help 查看支持命令。\n";
         return 1;
     }
@@ -129,6 +190,11 @@ int main(int argc, char** argv) {
     // 参数校验预检
     if (command == "clear-fault" && !all_axes && target_axis.empty()) {
         std::cerr << "[错误] 请指定待清错目标: --axis <D18..D24> 或 --all\n";
+        return 1;
+    }
+
+    if (command == "read-sdo" && !has_sdo_index) {
+        std::cerr << "[错误] read-sdo 必须指定 --index，例如 --index 0x6064。\n";
         return 1;
     }
 
@@ -291,6 +357,27 @@ int main(int argc, char** argv) {
         }
         std::cout << "---------------------------\n\n";
         return 0;
+    }
+
+    if (command == "read-sdo") {
+        if (!all_axes && target_axis.empty()) all_axes = true;
+        bool all_success = true;
+        for (int i = 1; i <= total_slaves; ++i) {
+            if (!all_axes && i != target_slave) continue;
+            std::vector<std::uint8_t> value;
+            const std::string name = robot_maint::slave_to_axis_name(i, total_slaves);
+            std::cout << name << " (从站 " << i << ") 0x"
+                      << std::hex << std::setw(4) << std::setfill('0') << sdo_index
+                      << ":" << std::setw(2) << sdo_subindex << std::dec << ": ";
+            if (engine.read_sdo_bytes(i, static_cast<std::uint16_t>(sdo_index),
+                                      static_cast<std::uint8_t>(sdo_subindex), value)) {
+                std::cout << format_sdo_value(value) << '\n';
+            } else {
+                std::cout << "读取失败（对象不存在、从站不支持 CoE、响应超时或数据超过 256 字节）\n";
+                all_success = false;
+            }
+        }
+        return all_success ? 0 : 1;
     }
 
     // 5. JOG

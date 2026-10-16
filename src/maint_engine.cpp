@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <fstream>
 #include <sstream>
+#include <array>
 
 namespace robot_maint {
 
@@ -124,6 +125,24 @@ std::vector<AxisStatus> MaintEngine::scan_all() {
 bool MaintEngine::read_position(int slave_index, std::int32_t& pos) {
     if (!initialized_ || slave_index <= 0 || slave_index > slave_count_) return false;
     return read_sdo(slave_index, SDO_ACTUAL_POSITION, 0, pos);
+}
+
+bool MaintEngine::read_sdo_bytes(int slave_index, std::uint16_t index,
+                                 std::uint8_t subindex, std::vector<std::uint8_t>& value) {
+    value.clear();
+    if (!initialized_ || slave_index <= 0 || slave_index > slave_count_ ||
+        (context_.slavelist[slave_index].mbx_proto & ECT_MBXPROT_COE) == 0) {
+        return false;
+    }
+
+    // 足够容纳常用标量和短字符串；SOEM 以 size 作为接收缓冲区上限。
+    std::array<std::uint8_t, 256> buffer{};
+    int size = static_cast<int>(buffer.size());
+    const int rc = ecx_SDOread(&context_, slave_index, index, subindex, FALSE,
+                               &size, buffer.data(), EC_TIMEOUTRXM);
+    if (rc <= 0 || size <= 0 || size > static_cast<int>(buffer.size())) return false;
+    value.assign(buffer.begin(), buffer.begin() + size);
+    return true;
 }
 
 bool MaintEngine::write_station_alias(int slave_index, std::uint16_t alias,

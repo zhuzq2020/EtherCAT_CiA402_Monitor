@@ -11,8 +11,9 @@
   1. `status`：查看从站拓扑、CiA-402状态、故障码、实际脉冲；
   2. `clear-fault`：单轴 / 全轴清除故障报警；
   3. `set-zero`：单轴 / 全轴标定绝对值编码器零位（同川 0x3801 协议，强制 `--confirm` 防误触）；
-  4. `read-pos`：快速读取当前编码器脉冲。
-  5. `write-alias`：备份 SII EEPROM 后，为任意厂商的 Hot Connect 组首写入 Station Alias。
+  4. `read-pos`：快速读取当前编码器脉冲；
+  5. `read-sdo`：按索引、子索引读取任意 CoE 对象；
+  6. `write-alias`：备份 SII EEPROM 后，为任意厂商的 Hot Connect 组首写入 Station Alias。
 
 ## 从站 ID、D18 与 Alias
 
@@ -87,7 +88,24 @@ sudo ./build/arm_maint set-zero --all --confirm
 sudo ./build/arm_maint read-pos
 ```
 
-### 6. 写入右臂组首 D18 的 Station Alias
+### 6. 读取指定 SDO 字段
+
+`--index` 必填，`--subindex` 默认为 0。可用 `--axis` 指定逻辑轴名或本次扫描的从站序号；不指定轴时读取全部从站。输出原始字节；当数据长度为 1、2、4 或 8 字节时，同时给出有符号和无符号十进制解释。请根据对象字典选择正确的解释，例如 `0x6064:00` 是有符号 32 位实际位置。
+
+```bash
+# 读取 D18 的实际位置 0x6064:00
+sudo ./build/arm_maint read-sdo --axis D18 --index 0x6064
+
+# 读取物理从站 1 的 Vendor ID 0x1018:01
+sudo ./build/arm_maint read-sdo --axis 1 --index 0x1018 --subindex 1
+
+# 所有从站的状态字 0x6041:00
+sudo ./build/arm_maint read-sdo --all --index 0x6041
+```
+
+单个对象最多读取 256 字节。失败时命令返回非零状态；请检查对象是否存在、从站是否支持 CoE、网络响应和数据长度。
+
+### 7. 写入右臂组首 D18 的 Station Alias
 
 先运行 `status`，确认目标电机确实是物理从站 1 且当前 Alias 为 0。写入会按 SII 容量字段备份完整 EEPROM，并核对备份中的 Vendor ID/Product Code 与在线身份一致；备份路径必须不存在。意优型号会自动通过厂商对象 `0x2679` 临时打开写权限，同川和其他型号使用标准 EtherCAT EEPROM 写入流程。
 

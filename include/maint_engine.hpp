@@ -57,6 +57,10 @@ public:
     // 快速读取单轴实际位置
     bool read_position(int slave_index, std::int32_t& pos);
 
+    // 读取任意 CoE 对象，保留原始字节，供调用方按对象类型解释。
+    bool read_sdo_bytes(int slave_index, std::uint16_t index,
+                        std::uint8_t subindex, std::vector<std::uint8_t>& value);
+
     // 将 Hot Connect 组首 Alias 写入任意 EtherCAT 从站 SII EEPROM。
     // 写入前完整备份 EEPROM，且仅允许从 0 初次配置，避免覆盖已有身份。
     bool write_station_alias(int slave_index, std::uint16_t alias,
