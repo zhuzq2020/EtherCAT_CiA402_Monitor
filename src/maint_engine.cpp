@@ -1,7 +1,11 @@
 #include "maint_engine.hpp"
 #include "jog_request.hpp"
+#include "sii_integrity.hpp"
+#include "eeprom_access.hpp"
 
 #include <poll.h>
+#include <fcntl.h>
+#include <functional>
 #include <unistd.h>
 #include <cerrno>
 #include <limits>
@@ -33,6 +37,58 @@ constexpr std::size_t kSiiHeaderWords = 64;
 // SOEM EEPROM addresses are 16-bit WORD offsets, so the largest addressable
 // image is 65536 words / 128 KiB.
 constexpr std::size_t kMaxSiiBytes = 128U * 1024U;
+
+class SoemEepromIo final : public EepromIo {
+public:
+    SoemEepromIo(ecx_contextt& context, std::uint16_t station)
+        : context_(context), station_(station) {}
+    int read(std::uint16_t reg, void* data, std::size_t size) override {
+        return ecx_FPRD(&context_.port, station_, reg, static_cast<int>(size), data, EC_TIMEOUTRET);
+    }
+    int write(std::uint16_t reg, const void* data, std::size_t size) override {
+        return ecx_FPWR(&context_.port, station_, reg, static_cast<int>(size),
+                         const_cast<void*>(data), EC_TIMEOUTRET);
+    }
+    std::uint64_t now_us() override {
+        return std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+    void pause_us(unsigned us) override { std::this_thread::sleep_for(std::chrono::microseconds(us)); }
+private:
+    ecx_contextt& context_;
+    std::uint16_t station_;
+};
+
+struct AliasCleanup {
+    std::function<void()> action;
+    ~AliasCleanup() { action(); }
+};
+
+bool save_sii_backup(const std::filesystem::path& path,
+                     const std::vector<std::uint16_t>& words, std::string& detail) {
+    // Persist explicit little-endian bytes; exclusive creation prevents a race
+    // between the path check and opening an existing backup for truncation.
+    std::vector<std::uint8_t> data(words.size() * 2);
+    for (std::size_t i = 0; i < words.size(); ++i) {
+        data[2 * i] = words[i] & 0xff;
+        data[2 * i + 1] = words[i] >> 8;
+    }
+    if (path.has_parent_path()) std::filesystem::create_directories(path.parent_path());
+    const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0644);
+    if (fd < 0) { detail = "无法新建备份 (拒绝覆盖): " + std::string(std::strerror(errno)); return false; }
+    bool ok = true;
+    std::size_t offset = 0;
+    while (offset < data.size()) {
+        const auto written = ::write(fd, data.data() + offset, data.size() - offset);
+        if (written < 0 && errno == EINTR) continue;
+        if (written <= 0) { ok = false; break; }
+        offset += static_cast<std::size_t>(written);
+    }
+    if (ok && ::fsync(fd) != 0) ok = false;
+    if (::close(fd) != 0) ok = false;
+    if (!ok) detail = "备份写入或同步失败，未开始 EEPROM 写入";
+    return ok;
+}
 
 std::string al_state_str(std::uint16_t state) {
     switch (state & 0x000fU) {
@@ -151,143 +207,249 @@ bool MaintEngine::read_sdo_bytes(int slave_index, std::uint16_t index,
     return true;
 }
 
+bool MaintEngine::read_station_alias(int slave_index, std::string& detail) {
+    if (!initialized_ || slave_index <= 0 || slave_index > slave_count_) {
+        detail = "从站索引超出范围";
+        return false;
+    }
+    auto& slave = context_.slavelist[slave_index];
+    SoemEepromIo io(context_, slave.configadr);
+    EepromAccess access(io, &std::cout);
+    std::uint16_t raw_alias = 0;
+    const int alias_wkc = io.read(ECT_REG_ALIAS, &raw_alias, sizeof(raw_alias));
+    if (alias_wkc != 1) {
+        detail = "读取 ESC Alias 失败，WKC=" + std::to_string(alias_wkc);
+        return false;
+    }
+    if (!access.acquire(detail)) {
+        std::string cleanup;
+        if (!access.restore(cleanup)) detail += "；恢复失败: " + cleanup;
+        return false;
+    }
+    std::array<std::uint16_t, 8> words{};
+    bool ok = true;
+    for (std::size_t i = 0; i < words.size(); ++i) {
+        if (!access.read_word(static_cast<std::uint16_t>(i), words[i], detail)) {
+            ok = false;
+            break;
+        }
+    }
+    std::string cleanup;
+    const bool restored = access.restore(cleanup);
+    if (!restored) { detail += "；恢复失败: " + cleanup; return false; }
+    slave.eep_pdi = (access.original().config & 1) ? 1 : 0;
+    if (!ok) return false;
+    const auto crc = sii_crc(words.data());
+    detail = "ESC Alias=" + std::to_string(etohs(raw_alias))
+           + "; EEPROM Alias=" + std::to_string(words[kSiiAliasWord])
+           + "; CRC stored=" + std::to_string(words[7] & 0xffU)
+           + ", calculated=" + std::to_string(crc)
+           + ((words[7] & 0xffU) == crc ? " (OK)" : " (不匹配)");
+    return (words[7] & 0xffU) == crc;
+}
+
+bool MaintEngine::backup_station_eeprom(int slave_index, const std::string& path, std::string& detail) {
+    if (!initialized_ || slave_index <= 0 || slave_index > slave_count_ || path.empty()) {
+        detail = "必须指定有效从站和备份路径";
+        return false;
+    }
+    auto& slave = context_.slavelist[slave_index];
+    SoemEepromIo io(context_, slave.configadr);
+    EepromAccess access(io, &std::cout);
+    auto fail = [&]() {
+        std::string cleanup;
+        if (!access.restore(cleanup)) detail += "；恢复失败: " + cleanup;
+        return false;
+    };
+    if (!access.acquire(detail)) return fail();
+    std::vector<std::uint16_t> words(kSiiHeaderWords);
+    for (std::size_t i = 0; i < words.size(); ++i)
+        if (!access.read_word(static_cast<std::uint16_t>(i), words[i], detail)) return fail();
+    const auto identity = [&](std::size_t i) {
+        return std::uint32_t(words[i]) | (std::uint32_t(words[i + 1]) << 16);
+    };
+    if (identity(ECT_SII_MANUF) != slave.eep_man || identity(ECT_SII_ID) != slave.eep_id) {
+        detail = "SII 身份与扫描结果不一致，未保存备份";
+        return fail();
+    }
+    const std::size_t bytes = (std::size_t(words[kSiiSizeWord]) + 1) * 128;
+    if (bytes < kSiiHeaderWords * 2 || bytes > kMaxSiiBytes) {
+        detail = "SII 容量无效，未保存备份";
+        return fail();
+    }
+    words.resize(bytes / 2);
+    for (std::size_t i = kSiiHeaderWords; i < words.size(); ++i)
+        if (!access.read_word(static_cast<std::uint16_t>(i), words[i], detail)) return fail();
+    try {
+        if (!save_sii_backup(path, words, detail)) return fail();
+    } catch (const std::exception& error) {
+        detail = std::string("保存备份失败: ") + error.what();
+        return fail();
+    }
+    std::string cleanup;
+    if (!access.restore(cleanup)) { detail = "备份已保存，但恢复控制权失败: " + cleanup; return false; }
+    slave.eep_pdi = (access.original().config & 1) ? 1 : 0;
+    detail = "EEPROM 只读备份完成，" + std::to_string(bytes) + " bytes；文件=" + path
+           + "; 配置 CRC=" + ((sii_crc(words.data()) == (words[7] & 0xff)) ? "OK" : "不匹配");
+    return true;
+}
+
 bool MaintEngine::write_station_alias(int slave_index, std::uint16_t alias,
                                       const std::string& backup_path, std::string& detail) {
     if (!initialized_ || slave_index <= 0 || slave_index > slave_count_) {
         detail = "从站索引超出范围";
         return false;
     }
-    if (alias == 0) {
-        detail = "Alias 0 表示未配置，拒绝写入";
+    if (alias == 0 || backup_path.empty()) {
+        detail = "必须指定非零 Alias 和 EEPROM 备份路径";
         return false;
     }
-    if (backup_path.empty()) {
-        detail = "必须指定 EEPROM 备份路径";
-        return false;
-    }
-
     auto& slave = context_.slavelist[slave_index];
     if (slave.eep_man == 0 || slave.eep_id == 0) {
-        detail = "在线从站的 Vendor ID/Product Code 无效，无法安全核验 EEPROM 身份";
+        detail = "在线从站身份无效，拒绝写入";
         return false;
     }
-    if (slave.aliasadr == alias) {
-        detail = "Alias 已是目标值，未执行 EEPROM 写入";
-        return true;
-    }
-    if (slave.aliasadr != 0) {
-        detail = "当前 Alias 非 0，拒绝覆盖已有身份";
+    SoemEepromIo io(context_, slave.configadr);
+    std::uint16_t raw_state = 0, raw_alias = 0;
+    if (io.read(ECT_REG_ALSTAT, &raw_state, sizeof(raw_state)) != 1
+        || io.read(ECT_REG_ALIAS, &raw_alias, sizeof(raw_alias)) != 1) {
+        detail = "读取从站 AL 状态或 ESC Alias 失败，未执行 EEPROM 写入";
         return false;
     }
-
-    const std::filesystem::path backup(backup_path);
-    if (std::filesystem::exists(backup)) {
-        detail = "备份文件已存在，拒绝覆盖: " + backup.string();
+    const auto state = etohs(raw_state);
+    const auto esc_alias = etohs(raw_alias);
+    if ((state & 0x10) || ((state & 0xf) != EC_STATE_INIT && (state & 0xf) != EC_STATE_PRE_OP)) {
+        detail = "写 Alias 要求从站无 AL 错误且处于 INIT/PRE-OP，实际=" + al_state_str(state);
         return false;
     }
-
-    const bool was_pdi_owned = slave.eep_pdi != 0;
-    bool permission_enabled = false;
-    bool master_owned = false;
-    auto restore = [&]() {
-        if (master_owned && was_pdi_owned) {
-            ecx_eeprom2pdi(&context_, static_cast<std::uint16_t>(slave_index));
+    if (slave.mbx_proto & ECT_MBXPROT_COE) {
+        std::uint16_t status = 0;
+        if (!read_sdo(slave_index, SDO_STATUS_WORD, 0, status) || (status & 0x0004U)) {
+            detail = "无法确认驱动器已退出 Operation Enabled，未执行 EEPROM 写入";
+            return false;
         }
+    }
+    std::cout << "[EEPROM] slave=" << slave_index << ", station=" << slave.configadr
+              << ", vendor=0x" << std::hex << slave.eep_man << ", product=0x" << slave.eep_id
+              << std::dec << ", AL=" << al_state_str(state) << ", ESC Alias=" << esc_alias << '\n';
+    if (slave.eep_man == kTongchuanVendorId) {
+        std::uint16_t alarm = 0;
+        if (!read_sdo(slave_index, SDO_TC_ECAT_ALARM, 0, alarm)) {
+            detail = "无法读取同川 Pr0.45 (0x302D) ECAT 报警码，未执行 EEPROM 写入";
+            return false;
+        }
+        std::cout << "[EEPROM] 同川 Pr0.45 ECAT 报警码=" << alarm
+                  << "；使用标准 SII 流程，不发送意优解锁或同川全参数保存指令\n";
+        if (alarm != 0) { detail = "同川 ECAT 报警未清除，未执行 EEPROM 写入"; return false; }
+    }
+
+    EepromAccess access(io, &std::cout);
+    bool permission_enabled = false;
+    bool cleaned = false;
+    auto restore = [&]() {
+        if (cleaned) return true;
+        cleaned = true;
+        std::string error;
+        bool ok = access.restore(error);
+        if (!ok) std::cerr << "[错误] 恢复 EEPROM 控制权失败: " << error << '\n';
+        if (ok && access.has_original()) slave.eep_pdi = (access.original().config & 1) ? 1 : 0;
         if (permission_enabled) {
             const std::uint8_t disable = 0;
-            write_sdo(slave_index, 0x2679, 0, disable);
+            const bool disabled = write_sdo(slave_index, 0x2679, 0, disable);
+            if (!disabled) std::cerr << "[错误] 关闭意优 EEPROM 写权限失败\n";
+            ok = disabled && ok;
         }
+        return ok;
     };
-    auto fail = [&](const std::string& message) {
-        restore();
-        detail = message;
+    AliasCleanup guard{[&]() { if (!cleaned) (void)restore(); }};
+    auto fail = [&](std::string message) {
+        if (!restore()) message += "；恢复 EEPROM 控制权或关闭写权限失败";
+        detail = std::move(message);
         return false;
     };
-
-    // 意优固件需要先通过厂商对象打开 EEPROM 写权限；同川及其他型号
-    // 直接使用标准 EtherCAT EEPROM 控制权切换，不发送厂商私有 SDO。
     if (slave.eep_man == kEyouVendorId) {
-        if ((slave.mbx_proto & ECT_MBXPROT_COE) == 0) {
-            detail = "意优从站不支持 CoE，无法通过 0x2679 开启 EEPROM 写权限";
-            return false;
-        }
+        if ((slave.mbx_proto & ECT_MBXPROT_COE) == 0)
+            return fail("意优从站不支持 CoE，无法开启 EEPROM 写权限");
         const std::uint8_t enable = 1;
-        if (!write_sdo(slave_index, 0x2679, 0, enable)) {
-            detail = "开启意优 EEPROM 修改权限失败 (0x2679=1)";
-            return false;
-        }
-        permission_enabled = true;
+        permission_enabled = true; // Also clean up an ambiguous SDO failure.
+        if (!write_sdo(slave_index, 0x2679, 0, enable))
+            return fail("开启意优 EEPROM 写权限失败 (0x2679=1)");
     }
+    if (!access.acquire(detail)) return fail(detail);
+    slave.eep_pdi = 0;
 
-    if (ecx_eeprom2master(&context_, static_cast<std::uint16_t>(slave_index)) <= 0) {
-        return fail("无法将 EEPROM 控制权切换给 EtherCAT 主站");
-    }
-    master_owned = true;
-
-    // EtherCAT SII word 0x3e stores (EEPROM bytes / 128) - 1. Read the
-    // standard 128-byte header first, then back up exactly the declared size.
     std::vector<std::uint16_t> words(kSiiHeaderWords);
-    for (std::size_t offset = 0; offset < kSiiHeaderWords; ++offset) {
-        const std::uint32_t value = ecx_readeeprom(
-            &context_, static_cast<std::uint16_t>(slave_index),
-            static_cast<std::uint16_t>(offset), EC_TIMEOUTEEP);
-        words[offset] = static_cast<std::uint16_t>(value & 0xffffU);
+    for (std::size_t i = 0; i < words.size(); ++i) {
+        if (!access.read_word(static_cast<std::uint16_t>(i), words[i], detail))
+            return fail("备份读取 word " + std::to_string(i) + " 失败: " + detail);
     }
-    const std::size_t sii_bytes =
-        (static_cast<std::size_t>(words[kSiiSizeWord]) + 1U) * 128U;
-    if (sii_bytes < kSiiHeaderWords * sizeof(std::uint16_t) ||
-        sii_bytes > kMaxSiiBytes || (sii_bytes % sizeof(std::uint16_t)) != 0) {
-        return fail("SII EEPROM 声明的容量无效，拒绝写入");
-    }
-    const std::size_t sii_words = sii_bytes / sizeof(std::uint16_t);
-    words.resize(sii_words);
-    for (std::size_t offset = kSiiHeaderWords; offset < words.size(); ++offset) {
-        const std::uint32_t value = ecx_readeeprom(
-            &context_, static_cast<std::uint16_t>(slave_index),
-            static_cast<std::uint16_t>(offset), EC_TIMEOUTEEP);
-        words[offset] = static_cast<std::uint16_t>(value & 0xffffU);
-    }
-
-    auto sii_u32 = [&](std::size_t offset) {
-        return static_cast<std::uint32_t>(words[offset])
-             | (static_cast<std::uint32_t>(words[offset + 1]) << 16U);
+    const auto sii_u32 = [&](std::size_t offset) {
+        return std::uint32_t(words[offset]) | (std::uint32_t(words[offset + 1]) << 16);
     };
-    if (words[kSiiAliasWord] != 0) {
-        return fail("SII EEPROM 中的 Alias 已非 0，拒绝覆盖");
+    if (sii_u32(ECT_SII_MANUF) != slave.eep_man || sii_u32(ECT_SII_ID) != slave.eep_id)
+        return fail("SII EEPROM 与在线从站身份不一致");
+    if (sii_crc(words.data()) != (words[7] & 0xffU))
+        return fail("原始 SII 配置 CRC 不匹配，拒绝写入");
+    if (words[kSiiAliasWord] == alias) {
+        if (!restore()) { detail = "恢复控制权或写权限失败"; return false; }
+        detail = "EEPROM Alias 已为目标值且 CRC 正确，未执行写入；当前 ESC Alias="
+               + std::to_string(esc_alias) + "，如未生效请重新上电后验证";
+        return true;
     }
-    if (sii_u32(ECT_SII_MANUF) != slave.eep_man ||
-        sii_u32(ECT_SII_ID) != slave.eep_id) {
-        return fail("SII EEPROM 身份与在线从站身份不一致");
+    std::cout << "[EEPROM] Alias 修改: EEPROM=" << words[kSiiAliasWord]
+              << " -> " << alias << "，当前 ESC Alias=" << esc_alias << '\n';
+    const std::size_t bytes = (std::size_t(words[kSiiSizeWord]) + 1U) * 128U;
+    if (bytes < kSiiHeaderWords * 2 || bytes > kMaxSiiBytes)
+        return fail("SII EEPROM 声明容量无效，拒绝写入");
+    words.resize(bytes / 2);
+    for (std::size_t i = kSiiHeaderWords; i < words.size(); ++i) {
+        if (!access.read_word(static_cast<std::uint16_t>(i), words[i], detail))
+            return fail("备份读取 word " + std::to_string(i) + " 失败: " + detail);
     }
-
+    const std::string after_path = backup_path + ".after.bin";
     try {
-        if (backup.has_parent_path()) {
-            std::filesystem::create_directories(backup.parent_path());
-        }
-        std::ofstream output(backup, std::ios::binary | std::ios::out);
-        if (!output) return fail("无法创建 EEPROM 备份: " + backup.string());
-        output.write(reinterpret_cast<const char*>(words.data()),
-                     static_cast<std::streamsize>(words.size() * sizeof(words[0])));
-        if (!output) return fail("EEPROM 备份写入不完整");
+        if (std::filesystem::exists(after_path)) return fail("写后镜像路径已存在，拒绝写入: " + after_path);
+        if (!save_sii_backup(backup_path, words, detail)) return fail(detail);
     } catch (const std::exception& error) {
         return fail(std::string("创建 EEPROM 备份失败: ") + error.what());
     }
-
-    if (ecx_writeeeprom(&context_, static_cast<std::uint16_t>(slave_index),
-                        kSiiAliasWord, alias, EC_TIMEOUTEEP) <= 0) {
-        return fail("写入 SII Alias word 失败；备份已保留在 " + backup.string());
+    std::cout << "[EEPROM] 完整备份已同步到磁盘: " << backup_path << " (" << bytes << " bytes)\n";
+    // Re-probe the protected configuration after backup, before the first write.
+    for (std::size_t i = 0; i < 8; ++i) {
+        std::uint16_t value = 0;
+        if (!access.read_word(static_cast<std::uint16_t>(i), value, detail)) return fail(detail);
+        if (value != words[i]) return fail("备份后 SII 配置区变化，未执行写入");
     }
-    const auto readback = static_cast<std::uint16_t>(ecx_readeeprom(
-        &context_, static_cast<std::uint16_t>(slave_index),
-        kSiiAliasWord, EC_TIMEOUTEEP) & 0xffffU);
-    if (readback != alias) {
-        return fail("Alias 写后回读不一致；请勿继续操作并保留 EEPROM 备份");
+    const auto before = words;
+    words[kSiiAliasWord] = alias;
+    words[7] = static_cast<std::uint16_t>((words[7] & 0xff00U) | sii_crc(words.data()));
+    // Match EC-Master's ESC configuration-area update. Keep every other word
+    // unchanged; finish the complete header and CRC before EEPROM readback.
+    std::array<std::uint16_t, 8> header{};
+    std::copy_n(words.begin(), header.size(), header.begin());
+    const bool written = access.write_config_header(header, detail);
+    const std::string write_error = written ? "" : detail;
+    std::vector<std::uint16_t> after(words.size());
+    for (std::size_t i = 0; i < after.size(); ++i) {
+        if (!access.read_word(static_cast<std::uint16_t>(i), after[i], detail))
+            return fail(write_error + (write_error.empty() ? "" : "；") + detail
+                        + "；无法完成写后镜像，停止重试并保留原备份=" + backup_path);
     }
-
-    restore();
-    slave.aliasadr = alias;
-    detail = "EEPROM Alias 写入并回读成功；备份=" + backup.string()
-           + "。请给该从站重新上电后再次运行 status 验证";
+    try {
+        if (!save_sii_backup(after_path, after, detail))
+            return fail(write_error + (write_error.empty() ? "" : "；") + detail
+                        + "；原备份=" + backup_path);
+    } catch (const std::exception& error) {
+        return fail(write_error + "；保存写后镜像失败: " + error.what() + "；原备份=" + backup_path);
+    }
+    std::cout << "[EEPROM] 完整写后镜像已保存: " << after_path << " (" << bytes << " bytes)\n";
+    if (!written)
+        return fail(write_error + "；停止重试，原备份=" + backup_path + "；写后镜像=" + after_path);
+    if (!verify_alias_image(before, after, alias, detail))
+        return fail(detail + "；停止重试，原备份=" + backup_path + "；写后镜像=" + after_path);
+    if (!restore()) { detail = "Alias/CRC 和完整镜像校验正确，但恢复控制权或写权限失败；备份=" + backup_path; return false; }
+    detail = "EEPROM Alias 和 CRC 写入成功，完整镜像校验通过，其余 words (含 PDO 信息) 未变化；备份=" + backup_path
+           + "；写后镜像=" + after_path + "。请安全重新上电，再运行 read-alias 和 status 验证 ESC Alias";
     return true;
 }
 

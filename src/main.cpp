@@ -90,12 +90,16 @@ void show_help() {
               << "  7. write-alias        将 Hot Connect 组首 Alias 写入从站 SII EEPROM（支持同川/意优/其他型号）\n"
               << "       --slave <1..N>     按本次扫描序号选择物理从站（不接受 Dxx，防止混淆）\n"
               << "       --alias <1..65535> 要写入的 Alias（右臂组首 D18 为 18）\n"
-              << "       --backup <FILE>    按 SII 声明容量保存完整 EEPROM 备份（不得已存在）\n"
+              << "       --backup <FILE>    保存完整写前备份及 <FILE>.after.bin 写后镜像（不得已存在）\n"
               << "       --confirm WRITE-EEPROM-ALIAS  精确确认短语\n\n"
               << "  8. enable             PDO 单轴使能会话，支持 jog-enabled 点动后保持使能，Ctrl+C 失能退出\n"
               << "       --axis <Dxx|1..N>  必填，不支持 --all\n"
               << "  9. disable            SDO 失能并回读确认\n"
               << "       --axis <Dxx|1..N> 或 --all\n\n"
+              << "  10. read-alias        读取 ESC Alias、EEPROM Alias、配置 CRC 和错误状态\n"
+              << "       --slave <1..N>     必填；不写 EEPROM，不清除已有错误\n\n"
+              << "  11. backup-sii        只读备份完整 EEPROM 内容，不覆盖已有文件\n"
+              << "       --slave <1..N> --backup <FILE>\n\n"
               << "示例:\n"
               << "  sudo ./arm_maint status\n"
               << "  sudo ./arm_maint clear-fault --axis D18\n"
@@ -165,10 +169,14 @@ int main(int argc, char** argv) {
             if (i + 1 < argc && std::string(argv[i + 1]) == "WRITE-EEPROM-ALIAS") {
                 confirmation_phrase = argv[++i];
             }
-        } else if (arg == "--slave") {
-            if (++i < argc) alias_slave = std::stoi(argv[i]);
-        } else if (arg == "--alias") {
-            if (++i < argc) alias_value = std::stoi(argv[i]);
+        } else if (arg == "--slave" || arg == "--alias") {
+            unsigned parsed = 0;
+            if (++i >= argc || !parse_object_address(argv[i], 0xffffU, parsed) || parsed == 0) {
+                std::cerr << "[错误] " << arg << " 必须是 1..65535 的整数。\n";
+                return 1;
+            }
+            if (arg == "--slave") alias_slave = static_cast<int>(parsed);
+            else alias_value = static_cast<int>(parsed);
         } else if (arg == "--backup") {
             if (++i < argc) backup_path = argv[i];
         } else if (arg == "--delta_deg") {
@@ -187,7 +195,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    if (command != "status" && command != "clear-fault" && command != "set-zero" && command != "read-pos" && command != "read-sdo" && command != "jog" && command != "write-alias" && command != "enable" && command != "disable") {
+    if (command != "status" && command != "clear-fault" && command != "set-zero" && command != "read-pos" && command != "read-sdo" && command != "jog" && command != "write-alias" && command != "read-alias" && command != "backup-sii" && command != "enable" && command != "disable") {
         std::cerr << "[错误] 未知命令: " << command << "，输入 --help 查看支持命令。\n";
         return 1;
     }
@@ -230,6 +238,16 @@ int main(int argc, char** argv) {
             has_delta_deg = true;
             delta_deg = 1.0; // 默认微调 1 度
         }
+    }
+
+    if (command == "backup-sii" && (alias_slave <= 0 || backup_path.empty())) {
+        std::cerr << "[错误] backup-sii 必须指定 --slave 和 --backup\n";
+        return 1;
+    }
+
+    if (command == "read-alias" && alias_slave <= 0) {
+        std::cerr << "[错误] read-alias 必须指定 --slave <1..N>\n";
+        return 1;
     }
 
     if (command == "write-alias") {
@@ -288,6 +306,20 @@ int main(int argc, char** argv) {
         }
         std::cout << "============================================================================================================\n\n";
         return 0;
+    }
+
+    if (command == "read-alias") {
+        std::string detail;
+        const bool ok = engine.read_station_alias(alias_slave, detail);
+        std::cout << (ok ? "[成功] " : "[失败] ") << detail << '\n';
+        return ok ? 0 : 1;
+    }
+
+    if (command == "backup-sii") {
+        std::string detail;
+        const bool ok = engine.backup_station_eeprom(alias_slave, backup_path, detail);
+        std::cout << (ok ? "[成功] " : "[失败] ") << detail << '\n';
+        return ok ? 0 : 1;
     }
 
     // 2. WRITE-ALIAS（按扫描序号选设备，避免把 D 逻辑名误当成硬件身份）

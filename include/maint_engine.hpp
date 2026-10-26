@@ -61,8 +61,11 @@ public:
     bool read_sdo_bytes(int slave_index, std::uint16_t index,
                         std::uint8_t subindex, std::vector<std::uint8_t>& value);
 
-    // 将 Hot Connect 组首 Alias 写入任意 EtherCAT 从站 SII EEPROM。
-    // 写入前完整备份 EEPROM，且仅允许从 0 初次配置，避免覆盖已有身份。
+    // 临时核验/切换 EEPROM 控制权，读取 ESC/SII Alias 与 CRC，再恢复原权限。
+    bool read_station_alias(int slave_index, std::string& detail);
+    bool backup_station_eeprom(int slave_index, const std::string& path, std::string& detail);
+    // INIT/PRE-OP 下备份并同步 EEPROM，校验身份后写 Alias/CRC；允许覆盖已有 Alias。
+    // 已为目标值时只校验。意优使用专用解锁，同川只读诊断并走标准 SII。
     bool write_station_alias(int slave_index, std::uint16_t alias,
                              const std::string& backup_path, std::string& detail);
 

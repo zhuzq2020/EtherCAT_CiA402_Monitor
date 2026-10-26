@@ -12,6 +12,9 @@ constexpr std::uint32_t kEyouVendorId = 0x00001097U;
 constexpr std::uint32_t kEyouProductCode = 0x00010002U;
 constexpr std::size_t kArmAxes = 7;
 
+// 同川协议 V2.0.8，Pr0.45：ECAT 报警码，UINT/RO。Alias 流程只读此对象。
+constexpr std::uint16_t SDO_TC_ECAT_ALARM = 0x302DU;
+
 // CiA-402 标准与专用 CoE SDO 索引
 constexpr std::uint16_t SDO_CONTROL_WORD           = 0x6040U; // 控制字 (uint16)
 constexpr std::uint16_t SDO_STATUS_WORD            = 0x6041U; // 状态字 (uint16)

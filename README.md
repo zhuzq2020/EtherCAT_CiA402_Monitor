@@ -107,7 +107,9 @@ sudo ./build/arm_maint read-sdo --all --index 0x6041
 
 ### 7. 写入右臂组首 D18 的 Station Alias
 
-先运行 `status`，确认目标电机确实是物理从站 1 且当前 Alias 为 0。写入会按 SII 容量字段备份完整 EEPROM，并核对备份中的 Vendor ID/Product Code 与在线身份一致；备份路径必须不存在。意优型号会自动通过厂商对象 `0x2679` 临时打开写权限，同川和其他型号使用标准 EtherCAT EEPROM 写入流程。
+先运行 `status` 和 `read-alias`，确认目标电机确实是物理从站 1、当前 EEPROM Alias 已核对且 CRC 正确。写入要求从站处于无 AL 错误的 INIT/PRE-OP；支持 CoE 的驱动还需确认未处于 Operation Enabled。同川型号读取 `Pr0.45 / 0x302D` 的 ECAT 报警码，读失败或非零时停止。
+
+工具按 SII 声明容量读取完整 EEPROM，核对 Vendor ID/Product Code，独占新建备份并同步到磁盘后才开始写入。意优型号通过 `0x2679` 临时打开写权限；同川使用标准 SII 流程，不调用意优解锁或 `0x313D` 全参数保存。
 
 ```bash
 sudo ./build/arm_maint status -i enp2s0
@@ -117,7 +119,7 @@ sudo ./build/arm_maint write-alias -i enp2s0 \
   --confirm WRITE-EEPROM-ALIAS
 ```
 
-成功后给该从站重新上电，再运行 `status`，确认 Alias 显示为 18。工具拒绝覆盖非零 Alias，也不会自动写 D19～D24。
+成功后给该从站重新上电，再运行 `read-alias --slave 1` 和 `status`，确认 EEPROM/ESC Alias 均为 18 且 CRC 正确。工具允许将已有 Alias 修改为其他 1..65535 的值，日志显示旧值和目标值；EEPROM 已是目标值时只校验、不重写，也不会自动写 D19～D24。
 
 ### 8. 使能与失能
 

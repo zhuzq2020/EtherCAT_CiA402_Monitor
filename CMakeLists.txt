@@ -42,6 +42,7 @@ target_include_directories(soem_static PUBLIC
 add_executable(arm_maint
     src/main.cpp
     src/maint_engine.cpp
+    src/eeprom_access.cpp
 )
 
 target_include_directories(arm_maint PRIVATE
@@ -59,3 +60,19 @@ target_link_libraries(arm_maint PRIVATE
 
 # 安装规则
 install(TARGETS arm_maint DESTINATION bin)
+
+include(CTest)
+if(BUILD_TESTING)
+    find_package(Python3 QUIET COMPONENTS Interpreter)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME alias_cli COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/alias_cli_test.py" "$<TARGET_FILE:arm_maint>")
+    endif()
+    add_executable(sii_integrity_test tests/sii_integrity_test.cpp)
+    target_include_directories(sii_integrity_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    add_test(NAME sii_integrity COMMAND sii_integrity_test)
+    add_executable(eeprom_access_test tests/eeprom_access_test.cpp src/eeprom_access.cpp)
+    target_include_directories(eeprom_access_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    target_compile_options(eeprom_access_test PRIVATE -Wall -Wextra -Wpedantic -Werror)
+    add_test(NAME eeprom_access COMMAND eeprom_access_test)
+endif()

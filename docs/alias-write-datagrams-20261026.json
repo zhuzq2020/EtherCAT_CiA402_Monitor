@@ -1,0 +1,69 @@
+{
+  "single_word_attempt": [
+    {
+      "word": 4,
+      "value": 11,
+      "bytes": 10,
+      "wkc": 1,
+      "payload": "01 02 04 00 00 00 0b 00 00 00"
+    }
+  ],
+  "complete_header_attempt": [
+    {
+      "word": 0,
+      "value": 3200,
+      "bytes": 10,
+      "wkc": 1,
+      "payload": "01 02 00 00 00 00 80 0c 00 00"
+    },
+    {
+      "word": 1,
+      "value": 26241,
+      "bytes": 10,
+      "wkc": 1,
+      "payload": "01 02 01 00 00 00 81 66 00 00"
+    },
+    {
+      "word": 2,
+      "value": 0,
+      "bytes": 10,
+      "wkc": 1,
+      "payload": "01 02 02 00 00 00 00 00 00 00"
+    },
+    {
+      "word": 3,
+      "value": 0,
+      "bytes": 10,
+      "wkc": 1,
+      "payload": "01 02 03 00 00 00 00 00 00 00"
+    },
+    {
+      "word": 4,
+      "value": 11,
+      "bytes": 10,
+      "wkc": 1,
+      "payload": "01 02 04 00 00 00 0b 00 00 00"
+    },
+    {
+      "word": 5,
+      "value": 0,
+      "bytes": 10,
+      "wkc": 1,
+      "payload": "01 02 05 00 00 00 00 00 00 00"
+    },
+    {
+      "word": 6,
+      "value": 0,
+      "bytes": 10,
+      "wkc": 1,
+      "payload": "01 02 06 00 00 00 00 00 00 00"
+    },
+    {
+      "word": 7,
+      "value": 86,
+      "bytes": 10,
+      "wkc": 1,
+      "payload": "01 02 07 00 00 00 56 00 00 00"
+    }
+  ]
+}
