@@ -92,6 +92,10 @@ void show_help() {
               << "       --alias <1..65535> 要写入的 Alias（右臂组首 D18 为 18）\n"
               << "       --backup <FILE>    按 SII 声明容量保存完整 EEPROM 备份（不得已存在）\n"
               << "       --confirm WRITE-EEPROM-ALIAS  精确确认短语\n\n"
+              << "  8. enable             PDO 单轴使能会话，支持 jog-enabled 点动后保持使能，Ctrl+C 失能退出\n"
+              << "       --axis <Dxx|1..N>  必填，不支持 --all\n"
+              << "  9. disable            SDO 失能并回读确认\n"
+              << "       --axis <Dxx|1..N> 或 --all\n\n"
               << "示例:\n"
               << "  sudo ./arm_maint status\n"
               << "  sudo ./arm_maint clear-fault --axis D18\n"
@@ -116,6 +120,7 @@ int main(int argc, char** argv) {
     }
 
     std::signal(SIGINT, sigint_handler);
+    std::signal(SIGTERM, sigint_handler);
 
     std::string iface = "enp2s0";
     std::string command;
@@ -182,8 +187,14 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    if (command != "status" && command != "clear-fault" && command != "set-zero" && command != "read-pos" && command != "read-sdo" && command != "jog" && command != "write-alias") {
+    if (command != "status" && command != "clear-fault" && command != "set-zero" && command != "read-pos" && command != "read-sdo" && command != "jog" && command != "write-alias" && command != "enable" && command != "disable") {
         std::cerr << "[错误] 未知命令: " << command << "，输入 --help 查看支持命令。\n";
+        return 1;
+    }
+
+    if ((command == "enable" && (target_axis.empty() || all_axes)) ||
+        (command == "disable" && ((target_axis.empty() && !all_axes) || (!target_axis.empty() && all_axes)))) {
+        std::cerr << "[错误] enable 必须指定单轴 --axis；disable 必须指定 --axis 或 --all，不能同时指定。\n";
         return 1;
     }
 
@@ -303,6 +314,20 @@ int main(int argc, char** argv) {
                       << " (当前总线从站总数: " << total_slaves << ")\n";
             return 1;
         }
+    }
+
+    if (command == "enable" || command == "disable") {
+        bool success = true;
+        for (int i = 1; i <= total_slaves; ++i) {
+            if (!all_axes && i != target_slave) continue;
+            std::string detail;
+            const bool ok = command == "enable" ? engine.enable_axis(i, detail)
+                                                  : engine.disable_axis(i, detail);
+            std::cout << "[" << robot_maint::slave_to_axis_name(i, total_slaves) << "] "
+                      << (ok ? "[成功] " : "[失败] ") << detail << '\n';
+            success = success && ok;
+        }
+        return success ? 0 : 1;
     }
 
     // 2. CLEAR-FAULT

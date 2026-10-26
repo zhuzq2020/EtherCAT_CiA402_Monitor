@@ -118,3 +118,45 @@ sudo ./build/arm_maint write-alias -i enp2s0 \
 ```
 
 成功后给该从站重新上电，再运行 `status`，确认 Alias 显示为 18。工具拒绝覆盖非零 Alias，也不会自动写 D19～D24。
+
+### 8. 使能与失能
+
+```bash
+# PDO 使能单轴并持续保持启动时的实际位置；Ctrl+C 或 SIGTERM 失能退出
+sudo ./build/arm_maint enable --axis D18
+
+# 独立 SDO 失能，回读状态字确认结果
+sudo ./build/arm_maint disable --axis D18
+sudo ./build/arm_maint disable --all
+```
+
+`enable` 使用与 Jog 共用的 CSP/PDO 初始化和使能握手，不下发位移增量。
+命令需要持续运行以维持 2 ms PDO 通信，不能退出后继续保证使能；不支持全轴同时使能。
+保持期间检测过程数据工作计数和 Operation Enabled 状态，异常时尝试失能并报错。
+请先停止 `enable`（Ctrl+C），再运行 Jog 或其他命令，勿让多个主站进程同时占用同一网口。
+`disable` 在 PRE-OP 下通过 SDO 写入 `0x6040=0x0006`，确认驱动器已退出运行使能。
+抱闸动作取决于驱动器配置，程序没有独立抱闸反馈检查；失能后负载需要机械支撑。
+Jog 仍自动执行使能、运动、失能的完整流程，无需提前运行 `enable`。
+
+### 9. 使能后点动，运动后保持使能
+
+先启动单轴使能会话：
+
+```bash
+sudo ./build/arm_maint enable --axis D18
+```
+
+看到 `[使能成功]` 后，在**同一个终端**输入以下会话指令（不加 `sudo` 或程序名）：
+
+```text
+jog-enabled --delta_deg 1.0 --speed_rpm 0.3
+jog-enabled --delta_count -5000
+```
+
+每次运动完成后继续发送 `0x000F` 并保持终点，可以反复输入点动指令。
+位移相对于上一次指令终点；必须明确指定一种非零位移，转速默认 0.5 RPM，允许 0.05~2.0 RPM。
+运动中拒绝新的点动指令，不排队；“指令发送完成”表示轨迹已发完，不代表实际位置已确认到位。
+输入 `disable`、`quit`、Ctrl+C，或标准输入关闭，会结束会话并执行失能。
+通信异常或驱动器退出运行使能时，也会终止并尝试失能。
+`jog-enabled` 仅属于已经使能的会话，不是另一个进程的独立命令。
+原有 `jog` 命令仍然会自动使能，运动结束自动失能。
