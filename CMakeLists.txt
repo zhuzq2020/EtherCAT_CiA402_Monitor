@@ -43,6 +43,9 @@ add_executable(arm_maint
     src/main.cpp
     src/maint_engine.cpp
     src/eeprom_access.cpp
+    src/motion_control.cpp
+    src/persistent_bus.cpp
+    src/control_service.cpp
 )
 
 target_include_directories(arm_maint PRIVATE
@@ -63,8 +66,13 @@ install(TARGETS arm_maint DESTINATION bin)
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(motion_control_test tests/motion_control_test.cpp src/motion_control.cpp)
+    target_include_directories(motion_control_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    add_test(NAME motion_control COMMAND motion_control_test)
     find_package(Python3 QUIET COMPONENTS Interpreter)
     if(Python3_Interpreter_FOUND)
+        add_test(NAME control_cli COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/control_cli_test.py" "$<TARGET_FILE:arm_maint>")
         add_test(NAME alias_cli COMMAND "${Python3_EXECUTABLE}"
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/alias_cli_test.py" "$<TARGET_FILE:arm_maint>")
     endif()

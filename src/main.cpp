@@ -1,4 +1,5 @@
 #include "maint_engine.hpp"
+#include "control_service.hpp"
 #include "tongchuan_def.hpp"
 
 #include <iostream>
@@ -92,14 +93,18 @@ void show_help() {
               << "       --alias <1..65535> 要写入的 Alias（右臂组首 D18 为 18）\n"
               << "       --backup <FILE>    保存完整写前备份及 <FILE>.after.bin 写后镜像（不得已存在）\n"
               << "       --confirm WRITE-EEPROM-ALIAS  精确确认短语\n\n"
-              << "  8. enable             PDO 单轴使能会话，支持 jog-enabled 点动后保持使能，Ctrl+C 失能退出\n"
-              << "       --axis <Dxx|1..N>  必填，不支持 --all\n"
-              << "  9. disable            SDO 失能并回读确认\n"
+              << "  8. enable             后台 PDO 使能并返回终端，可多轴，持续保持当前位置\n"
+              << "       --axis D18,D19     或重复 --axis D18 --axis D19\n"
+              << "  9. disable            单轴/多轴失能；--all 失能并停止后台 PDO 服务\n"
               << "       --axis <Dxx|1..N> 或 --all\n\n"
               << "  10. read-alias        读取 ESC Alias、EEPROM Alias、配置 CRC 和错误状态\n"
               << "       --slave <1..N>     必填；不写 EEPROM，不清除已有错误\n\n"
               << "  11. backup-sii        只读备份完整 EEPROM 内容，不覆盖已有文件\n"
               << "       --slave <1..N> --backup <FILE>\n\n"
+              << "  12. jog-enabled      独立命令：只对已使能轴点动，不自动使能\n"
+              << "       --axis D18,D19 --delta_deg 1.0 [--speed_rpm 0.3]\n"
+              << "       多轴不同角度: --axis D18,D19 --delta_deg 1.0,-0.5（按轴顺序对应）\n"
+              << "       或 --delta_count 5000,-2000；单值应用全部轴；完成后继续使能\n\n"
               << "示例:\n"
               << "  sudo ./arm_maint status\n"
               << "  sudo ./arm_maint clear-fault --axis D18\n"
@@ -125,6 +130,8 @@ int main(int argc, char** argv) {
 
     std::signal(SIGINT, sigint_handler);
     std::signal(SIGTERM, sigint_handler);
+    int control_exit = 0;
+    if (robot_maint::handle_control_cli(argc, argv, control_exit)) return control_exit;
 
     std::string iface = "enp2s0";
     std::string command;
@@ -200,12 +207,6 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    if ((command == "enable" && (target_axis.empty() || all_axes)) ||
-        (command == "disable" && ((target_axis.empty() && !all_axes) || (!target_axis.empty() && all_axes)))) {
-        std::cerr << "[错误] enable 必须指定单轴 --axis；disable 必须指定 --axis 或 --all，不能同时指定。\n";
-        return 1;
-    }
-
     // 参数校验预检
     if (command == "clear-fault" && !all_axes && target_axis.empty()) {
         std::cerr << "[错误] 请指定待清错目标: --axis <D18..D24> 或 --all\n";
@@ -262,6 +263,25 @@ int main(int argc, char** argv) {
         }
     }
 
+    // A running PDO owner must never be rescanned by another CLI invocation.
+    std::string service_reply;
+    std::string read_request = "status";
+    if (command == "read-pos") read_request = "read-pos" + (target_axis.empty() ? std::string{} : " " + target_axis);
+    const int active_service = robot_maint::control_request(iface, read_request, service_reply, 2000);
+    if (active_service != 0) {
+        if (active_service > 0 && (command == "status" || command == "read-pos")) {
+            std::cout << service_reply;
+            return 0;
+        }
+        std::cerr << "[错误] " << (active_service < 0 ? service_reply :
+            "该网口已有后台 PDO 服务。点动请用 jog-enabled；其他维护操作前先 disable --all。") << '\n';
+        return 1;
+    }
+    robot_maint::InterfaceLock bus_lock;
+    if (!bus_lock.acquire(iface, service_reply)) {
+        std::cerr << "[错误] " << service_reply << '\n';
+        return 1;
+    }
     robot_maint::MaintEngine engine(iface);
     std::cout << "[INFO] 正在初始化以太网口: " << iface << " ...\n";
     if (!engine.init()) {
@@ -346,20 +366,6 @@ int main(int argc, char** argv) {
                       << " (当前总线从站总数: " << total_slaves << ")\n";
             return 1;
         }
-    }
-
-    if (command == "enable" || command == "disable") {
-        bool success = true;
-        for (int i = 1; i <= total_slaves; ++i) {
-            if (!all_axes && i != target_slave) continue;
-            std::string detail;
-            const bool ok = command == "enable" ? engine.enable_axis(i, detail)
-                                                  : engine.disable_axis(i, detail);
-            std::cout << "[" << robot_maint::slave_to_axis_name(i, total_slaves) << "] "
-                      << (ok ? "[成功] " : "[失败] ") << detail << '\n';
-            success = success && ok;
-        }
-        return success ? 0 : 1;
     }
 
     // 2. CLEAR-FAULT

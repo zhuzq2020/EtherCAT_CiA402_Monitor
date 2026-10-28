@@ -1,9 +1,7 @@
 #include "maint_engine.hpp"
-#include "jog_request.hpp"
 #include "sii_integrity.hpp"
 #include "eeprom_access.hpp"
 
-#include <poll.h>
 #include <fcntl.h>
 #include <functional>
 #include <unistd.h>
@@ -715,11 +713,7 @@ bool MaintEngine::configure_dynamic_pdo(int slave_index) {
 }
 
 bool MaintEngine::jog_axis_counts(int slave_index, std::int32_t delta_counts, double speed_rpm, std::string& detail) {
-    return run_position_control(slave_index, delta_counts, speed_rpm, false, detail);
-}
-
-bool MaintEngine::enable_axis(int slave_index, std::string& detail) {
-    return run_position_control(slave_index, 0, 0.5, true, detail);
+    return run_position_control(slave_index, delta_counts, speed_rpm, detail);
 }
 
 bool MaintEngine::disable_axis(int slave_index, std::string& detail) {
@@ -751,13 +745,13 @@ bool MaintEngine::disable_axis(int slave_index, std::string& detail) {
 }
 
 bool MaintEngine::run_position_control(int slave_index, std::int32_t delta_counts,
-                                       double speed_rpm, bool hold_enabled, std::string& detail) {
+                                       double speed_rpm, std::string& detail) {
     if (!initialized_ || slave_index <= 0 || slave_index > slave_count_) {
         detail = "从站索引超出范围";
         return false;
     }
 
-    if (!hold_enabled && delta_counts == 0) {
+    if (delta_counts == 0) {
         detail = "点动位移脉冲为 0";
         return false;
     }
@@ -926,111 +920,6 @@ bool MaintEngine::run_position_control(int slave_index, std::int32_t delta_count
         return false;
     }
 
-    bool hold_ok = true;
-    if (hold_enabled) {
-        // Resolve ratio before entering the cyclic loop; no mailbox reads while moving.
-        double counts_per_deg = 131072.0 * 101.0 / 360.0;
-        get_axis_ratio(slave_index, counts_per_deg);
-        std::cout << "[使能成功] 保持当前位置 " << start_pos << " counts\n"
-                  << "输入 jog-enabled --delta_deg 1.0 [--speed_rpm 0.5]\n"
-                  << "或 jog-enabled --delta_count 5000；输入 disable 或 Ctrl+C 失能退出。"
-                  << std::endl;
-        std::string command_line;
-        bool discard_line = false;
-        bool moving = false;
-        int32_t motion_start = start_pos;
-        int32_t motion_delta = 0;
-        std::int64_t motion_cycle = 0, motion_cycles = 1;
-        auto next_hold = std::chrono::steady_clock::now();
-        while (!stop_requested_.load()) {
-            // poll + single-byte read avoids blocking the PDO loop on an incomplete line.
-            // Bound input processing to keep one cycle from consuming an unlimited stream.
-            for (int n = 0; n < 256; ++n) {
-                pollfd input{STDIN_FILENO, POLLIN, 0};
-                const int ready = ::poll(&input, 1, 0);
-                if (ready < 0) {
-                    if (errno != EINTR) { hold_ok = false; stop_requested_.store(true); }
-                    break;
-                }
-                if (ready == 0) break;
-                if (input.revents & (POLLERR | POLLNVAL)) {
-                    hold_ok = false; stop_requested_.store(true); break;
-                }
-                char ch = 0;
-                const auto bytes = ::read(STDIN_FILENO, &ch, 1);
-                if (bytes <= 0) {
-                    if (bytes == 0 || errno != EINTR) stop_requested_.store(true);
-                    break;
-                }
-                if (ch != '\n') {
-                    if (command_line.size() < 512 && !discard_line) command_line += ch;
-                    else { discard_line = true; command_line.clear(); }
-                    continue;
-                }
-                const auto line = command_line;
-                command_line.clear();
-                if (discard_line) {
-                    discard_line = false;
-                    std::cout << "[拒绝] 输入过长\n";
-                    continue;
-                }
-                std::istringstream words(line);
-                std::string verb, extra;
-                words >> verb;
-                if (verb.empty()) continue;
-                if ((verb == "disable" || verb == "quit") && !(words >> extra)) {
-                    stop_requested_.store(true); break;
-                }
-                if (moving) {
-                    std::cout << "[拒绝] 正在运动，请等待本次完成\n";
-                    continue;
-                }
-                JogRequest request;
-                std::string error;
-                if (!parse_enabled_jog(line, counts_per_deg, request, error)) {
-                    std::cout << "[拒绝] " << error << '\n';
-                    continue;
-                }
-                const std::int64_t target = static_cast<std::int64_t>(current_cmd) + request.delta_counts;
-                if (target < std::numeric_limits<int32_t>::min() ||
-                    target > std::numeric_limits<int32_t>::max()) {
-                    std::cout << "[拒绝] 目标位置超出 int32 范围\n";
-                    continue;
-                }
-                motion_start = current_cmd;
-                motion_delta = request.delta_counts;
-                const double seconds = std::max(1.0, std::abs(static_cast<double>(motion_delta)) /
-                    (counts_per_deg * 360.0) / request.speed_rpm * 60.0);
-                motion_cycles = static_cast<std::int64_t>(std::ceil(seconds / 0.002));
-                motion_cycle = 0;
-                moving = true;
-                std::cout << "[JOG 启动] 增量 " << motion_delta << " counts\n";
-            }
-            if (stop_requested_.load()) break;
-            if (moving) {
-                const double t = static_cast<double>(++motion_cycle) / motion_cycles;
-                current_cmd = static_cast<int32_t>(static_cast<std::int64_t>(motion_start) +
-                    std::llround(static_cast<double>(motion_delta) * smoothstep5(t)));
-            }
-            set_out(0x000f, current_cmd, 8);
-            ecx_send_processdata(&context_);
-            const int wkc = ecx_receive_processdata(&context_, EC_TIMEOUTRXM);
-            const int expected_wkc = context_.grouplist[0].outputsWKC * 2 +
-                                     context_.grouplist[0].inputsWKC;
-            if (wkc < expected_wkc || (get_in_status() & 0x006fU) != 0x0027U) {
-                hold_ok = false;
-                break;
-            }
-            if (moving && motion_cycle >= motion_cycles) {
-                moving = false;
-                std::cout << "[JOG 指令发送完成] 保持终点 " << current_cmd
-                          << " counts，继续使能；实际位置 " << get_in_pos() << " counts\n";
-            }
-            next_hold += std::chrono::milliseconds(2);
-            std::this_thread::sleep_until(next_hold);
-        }
-    }
-
     // 5. 计算点动运行总时长与 2ms 周期循环参数
     double counts_per_rev = 131072.0 * 101.0;
     double counts_per_deg = counts_per_rev / 360.0;
@@ -1044,7 +933,7 @@ bool MaintEngine::run_position_control(int slave_index, std::int32_t delta_count
     constexpr int cycle_us = 2000; // 2ms 控制周期
     const int total_cycles = static_cast<int>(duration_s * 1000000.0 / cycle_us);
 
-    if (!hold_enabled) std::cout << "  [JOG 启动] 目标增量: " << delta_counts << " counts ("
+    std::cout << "  [JOG 启动] 目标增量: " << delta_counts << " counts ("
               << std::fixed << std::setprecision(2) << (delta_counts / counts_per_deg) << " deg), "
               << "规划时长: " << std::setprecision(2) << duration_s << " s, 输出转速: " << speed_rpm << " RPM\n";
 
@@ -1052,7 +941,7 @@ bool MaintEngine::run_position_control(int slave_index, std::int32_t delta_count
     auto next_time = std::chrono::steady_clock::now();
     bool completed = true;
 
-    for (int c = 1; !hold_enabled && c <= total_cycles; ++c) {
+    for (int c = 1; c <= total_cycles; ++c) {
         if (stop_requested_.load()) {
             completed = false;
             std::cout << "\n  [JOG 中断] 收到停止信号 (Ctrl+C)，安全停机抱闸...\n";
@@ -1073,7 +962,7 @@ bool MaintEngine::run_position_control(int slave_index, std::int32_t delta_count
 
     // 7. 到位后保持当前终点 200ms
     int32_t final_hold = current_cmd;
-    for (int h = 0; !hold_enabled && h < 100; ++h) {
+    for (int h = 0; h < 100; ++h) {
         set_out(0x000f, final_hold, 8);
         ecx_send_processdata(&context_);
         ecx_receive_processdata(&context_, EC_TIMEOUTRXM);
@@ -1098,12 +987,6 @@ bool MaintEngine::run_position_control(int slave_index, std::int32_t delta_count
            + std::to_string((final_actual - start_pos) / counts_per_deg) + " deg), 当前绝对位置: "
            + std::to_string(final_actual);
 
-    if (hold_enabled) {
-        std::string disable_detail;
-        const bool disabled = disable_axis(slave_index, disable_detail);
-        detail = (hold_ok ? "使能保持结束；" : "过程数据异常或驱动器退出使能；") + disable_detail;
-        return hold_ok && disabled;
-    }
     return completed;
 }
 

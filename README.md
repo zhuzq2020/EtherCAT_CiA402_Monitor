@@ -6,14 +6,16 @@
 
 - **零内核模块依赖**：基于纯用户态 SOEM 协议栈，通过 Linux 原生 Raw Socket 访问网卡，**无需加载 `ec_master.ko` 等内核驱动**，升级内核绝不崩溃。
 - **零外部动态库依赖**：项目内置 SOEM 源码静态打包，生成单一小巧二进制（< 400KB），无需安装系统依赖。
-- **纯 SDO 安全交互**：仅初始化至 PRE-OP 状态，杜绝任何电机误动飞车风险。
+- **维护与运动分开**：常规 SDO/EEPROM 维护使用 PRE-OP；使能和点动由持有网口的 PDO 进程在 OP 下执行。
 - **核心功能**：
   1. `status`：查看从站拓扑、CiA-402状态、故障码、实际脉冲；
   2. `clear-fault`：单轴 / 全轴清除故障报警；
   3. `set-zero`：单轴 / 全轴标定绝对值编码器零位（同川 0x3801 协议，强制 `--confirm` 防误触）；
   4. `read-pos`：快速读取当前编码器脉冲；
   5. `read-sdo`：按索引、子索引读取任意 CoE 对象；
-  6. `write-alias`：备份 SII EEPROM 后，为任意厂商的 Hot Connect 组首写入 Station Alias。
+  6. `write-alias`：备份 SII EEPROM 后，为 Hot Connect 组首写入 Station Alias；
+  7. `enable` / `disable`：单轴或多轴使能/失能，后台持续保持；
+  8. `jog-enabled`：独立命令，对已经使能的单轴或多轴点动，完成后继续使能。
 
 ## 从站 ID、D18 与 Alias
 
@@ -121,44 +123,61 @@ sudo ./build/arm_maint write-alias -i enp2s0 \
 
 成功后给该从站重新上电，再运行 `read-alias --slave 1` 和 `status`，确认 EEPROM/ESC Alias 均为 18 且 CRC 正确。工具允许将已有 Alias 修改为其他 1..65535 的值，日志显示旧值和目标值；EEPROM 已是目标值时只校验、不重写，也不会自动写 D19～D24。
 
-### 8. 使能与失能
+### 8. 独立命令使能、点动和失能（支持多轴）
+
+每条命令都从普通终端运行，可以在同一终端依次执行，也可以使用不同终端。`enable` 启动后台 PDO 服务并完成握手后返回，之后不需要在会话内输入指令。所有命令使用相同的用户身份和网卡参数；以下为本机 `eno0` 示例。
 
 ```bash
-# PDO 使能单轴并持续保持启动时的实际位置；Ctrl+C 或 SIGTERM 失能退出
-sudo ./build/arm_maint enable --axis D18
+# 单轴使能，成功后返回终端；后台保持当前位置
+sudo ./build/arm_maint enable -i eno0 --axis D18
 
-# 独立 SDO 失能，回读状态字确认结果
-sudo ./build/arm_maint disable --axis D18
-sudo ./build/arm_maint disable --all
+# 独立点动命令：只接受已经使能的轴，不自动使能
+sudo ./build/arm_maint jog-enabled -i eno0 --axis D18 --delta_deg 1.0 --speed_rpm 0.3
+sudo ./build/arm_maint jog-enabled -i eno0 --axis D18 --delta_count -5000
+
+# 同时使能多个轴，也可以重复 --axis D18 --axis D19
+sudo ./build/arm_maint enable -i eno0 --axis D18,D19
+
+# 两个目标在同一周期开始，按各自的角度换算比例同步规划
+sudo ./build/arm_maint jog-enabled -i eno0 --axis D18,D19 --delta_deg 1.0 --speed_rpm 0.3
+
+# 不同角度：D18 +1.0 度，D19 -0.5 度，按 --axis 顺序对应
+sudo ./build/arm_maint jog-enabled -i eno0 --axis D18,D19 --delta_deg 1.0,-0.5 --speed_rpm 0.3
+
+# 不同脉冲数：D18 +5000，D19 -2000
+sudo ./build/arm_maint jog-enabled -i eno0 --axis D18,D19 --delta_count 5000,-2000
+
+# 查询后台 PDO 反馈，不重新扫描或改变使能状态
+sudo ./build/arm_maint status -i eno0
+sudo ./build/arm_maint read-pos -i eno0
+
+# 失能选定轴，其余轴继续保持
+sudo ./build/arm_maint disable -i eno0 --axis D18,D19
+
+# 失能全部受控轴、结束后台服务并释放网口
+sudo ./build/arm_maint disable -i eno0 --all
 ```
 
-`enable` 使用与 Jog 共用的 CSP/PDO 初始化和使能握手，不下发位移增量。
-命令需要持续运行以维持 2 ms PDO 通信，不能退出后继续保证使能；不支持全轴同时使能。
-保持期间检测过程数据工作计数和 Operation Enabled 状态，异常时尝试失能并报错。
-请先停止 `enable`（Ctrl+C），再运行 Jog 或其他命令，勿让多个主站进程同时占用同一网口。
-`disable` 在 PRE-OP 下通过 SDO 写入 `0x6040=0x0006`，确认驱动器已退出运行使能。
-抱闸动作取决于驱动器配置，程序没有独立抱闸反馈检查；失能后负载需要机械支撑。
-Jog 仍自动执行使能、运动、失能的完整流程，无需提前运行 `enable`。
+`jog-enabled` 必须指定 `--delta_deg` 或 `--delta_count`，不能同时指定。位移可以是单个数值（所有目标轴使用相同增量），或逗号分隔的列表（依照 `--axis` 顺序逐一对应）；列表长度必须等于目标轴数量，重复 `--axis` 也按出现顺序对应。正负数表示不同方向，都是相对于上次指令终点的增量，不是绝对角度。列表中的 0 表示该轴保持不动，但该轴同样必须已使能；不能全部为 0。多轴使用同一个转速上限，按各轴位移和换算比例规划为同周期开始、同时结束；转速默认 0.5 RPM，允许 0.05～2.0 RPM。使用五次平滑插值，按峰值速度限制规划时长；单次命令最长 120 秒。独立终端对不同轴发送的点动也可并行；与正在运动的轴重叠的点动请求报错，不排队。
 
-### 9. 使能后点动，运动后保持使能
-
-先启动单轴使能会话：
-
-```bash
-sudo ./build/arm_maint enable --axis D18
-```
-
-看到 `[使能成功]` 后，在**同一个终端**输入以下会话指令（不加 `sudo` 或程序名）：
+所有目标统一预检后才启动本次运动。任意目标未使能、PDO 状态无效、非 CSP、正在运动或目标位置超限，整条命令拒绝，所有目标都不开始本次点动。例如 D18 已使能、D19 未使能时：
 
 ```text
-jog-enabled --delta_deg 1.0 --speed_rpm 0.3
-jog-enabled --delta_count -5000
+[失败] D19 未使能（SwitchOnDisabled (下使能)）；整条点动命令已拒绝，所有目标轴均未开始本次运动
 ```
 
-每次运动完成后继续发送 `0x000F` 并保持终点，可以反复输入点动指令。
-位移相对于上一次指令终点；必须明确指定一种非零位移，转速默认 0.5 RPM，允许 0.05~2.0 RPM。
-运动中拒绝新的点动指令，不排队；“指令发送完成”表示轨迹已发完，不代表实际位置已确认到位。
-输入 `disable`、`quit`、Ctrl+C，或标准输入关闭，会结束会话并执行失能。
-通信异常或驱动器退出运行使能时，也会终止并尝试失能。
-`jog-enabled` 仅属于已经使能的会话，不是另一个进程的独立命令。
-原有 `jog` 命令仍然会自动使能，运动结束自动失能。
+若服务未启动，错误会逐一列出请求中的轴名，例如 `D18 未使能（无运行中的 PDO 使能服务）`。轴名按扫描序号解析；7 轴右臂显示 D18～D24，与 Station Alias 无关。其他拓扑建议使用 `S1`、`S2` 或数字序号。
+
+运动结束后保持终点并继续使能，`jog-enabled` 进程返回终端。这里的完成表示轨迹发送完成，不是额外的到位误差检测。等待点动/使能命令时按 Ctrl+C 会关闭请求，服务取消本次目标并尝试失能；成功返回的 `enable` 不依赖该终端存活，需要用 `disable` 停止保持。
+
+后台服务为每个网口持有独占锁，只有一个进程访问 SOEM/PDO。服务启动时读取真实 PDO 映射确认 Controlword、Target Position、Statusword、Actual Position 等字段，不按字节总长猜偏移，也不在运行期间重映射 PDO。每 2 ms 交换过程数据；工作计数、驱动状态或控制周期异常时停止全部受控运动并尝试失能。收到对多轴运动中一个成员的失能命令时，同一批次的其他成员停止增量并保持当前指令位置。
+
+服务运行时 `status`、`read-pos` 从同一服务读取快照，不建立第二个主站。`jog`、清错、标零、SDO/EEPROM 读写等其他维护操作会拒绝执行；先 `disable --all` 结束服务再操作。没有后台服务时，`disable` 仍可使用原有 SDO Shutdown 方式失能。
+
+后台日志位于 `/tmp/arm_maint-control-<运行用户UID>/<网卡>.log`；使用 sudo 时通常为 `/tmp/arm_maint-control-0/eno0.log`。不要直接删除活动服务的套接字或锁文件；用 `disable --all` 退出。
+
+原有 `jog` 保留自动使能、点动、结束失能的行为；独立 `jog-enabled` 从不自动使能。抱闸动作依赖驱动器配置，程序没有独立抱闸反馈检查。
+
+新增流程已通过模拟 PDO 的多轴原子校验、握手、运动规划、错误轴名、取消/失能和通信异常测试，以及 Unix 套接字 CLI 测试。尚未进行实机使能/运动验证；本次开发没有向电机发送使能或运动指令。
+
+升级含不同位移列表的版本后，若旧后台服务仍在运行，先执行 `disable -i eno0 --all`，再用新版 `enable` 重新启动。仅替换可执行文件不会改变已经运行的旧进程；不要在使能保持期间直接删除套接字或杀进程来升级。

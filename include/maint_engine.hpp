@@ -69,8 +69,6 @@ public:
     bool write_station_alias(int slave_index, std::uint16_t alias,
                              const std::string& backup_path, std::string& detail);
 
-    // PDO 使能并保持当前位置，直到收到停止请求后失能退出。
-    bool enable_axis(int slave_index, std::string& detail);
     // SDO Shutdown，并回读确认退出 Operation Enabled。
     bool disable_axis(int slave_index, std::string& detail);
 
@@ -100,8 +98,9 @@ public:
     }
 
 private:
+    friend class PersistentPdoBus;
     bool run_position_control(int slave_index, std::int32_t delta_counts,
-                              double speed_rpm, bool hold_enabled, std::string& detail);
+                              double speed_rpm, std::string& detail);
     bool get_axis_ratio(int slave_index, double& counts_per_deg);
     bool configure_dynamic_pdo(int slave_index);
 
