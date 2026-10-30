@@ -61,6 +61,8 @@ public:
     bool read_sdo_bytes(int slave_index, std::uint16_t index,
                         std::uint8_t subindex, std::vector<std::uint8_t>& value);
 
+    bool configure_tongchuan_pdo(int slave, bool apply, const std::string& backup, std::string& detail, bool save = false);
+
     // 临时核验/切换 EEPROM 控制权，读取 ESC/SII Alias 与 CRC，再恢复原权限。
     bool read_station_alias(int slave_index, std::string& detail);
     bool backup_station_eeprom(int slave_index, const std::string& path, std::string& detail);

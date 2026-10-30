@@ -62,15 +62,8 @@ struct AliasCleanup {
     ~AliasCleanup() { action(); }
 };
 
-bool save_sii_backup(const std::filesystem::path& path,
-                     const std::vector<std::uint16_t>& words, std::string& detail) {
-    // Persist explicit little-endian bytes; exclusive creation prevents a race
-    // between the path check and opening an existing backup for truncation.
-    std::vector<std::uint8_t> data(words.size() * 2);
-    for (std::size_t i = 0; i < words.size(); ++i) {
-        data[2 * i] = words[i] & 0xff;
-        data[2 * i + 1] = words[i] >> 8;
-    }
+bool save_pdo_backup(const std::filesystem::path& path,
+                     const std::vector<std::uint8_t>& data, std::string& detail) {
     if (path.has_parent_path()) std::filesystem::create_directories(path.parent_path());
     const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0644);
     if (fd < 0) { detail = "无法新建备份 (拒绝覆盖): " + std::string(std::strerror(errno)); return false; }
@@ -86,6 +79,18 @@ bool save_sii_backup(const std::filesystem::path& path,
     if (::close(fd) != 0) ok = false;
     if (!ok) detail = "备份写入或同步失败，未开始 EEPROM 写入";
     return ok;
+}
+
+bool save_sii_backup(const std::filesystem::path& path,
+                     const std::vector<std::uint16_t>& words, std::string& detail) {
+    // Persist explicit little-endian bytes; exclusive creation prevents a race
+    // between the path check and opening an existing backup for truncation.
+    std::vector<std::uint8_t> data(words.size() * 2);
+    for (std::size_t i = 0; i < words.size(); ++i) {
+        data[2 * i] = words[i] & 0xff;
+        data[2 * i + 1] = words[i] >> 8;
+    }
+    return save_pdo_backup(path, data, detail);
 }
 
 std::string al_state_str(std::uint16_t state) {
@@ -202,6 +207,172 @@ bool MaintEngine::read_sdo_bytes(int slave_index, std::uint16_t index,
                                &size, buffer.data(), EC_TIMEOUTRXM);
     if (rc <= 0 || size <= 0 || size > static_cast<int>(buffer.size())) return false;
     value.assign(buffer.begin(), buffer.begin() + size);
+    return true;
+}
+
+// 维护命令仅在 PREOP 下修改 RAM 映射；失败后停止，不自动回滚或保存 Flash。
+bool MaintEngine::configure_tongchuan_pdo(int slave, bool apply,
+                                         const std::string& backup, std::string& detail, bool save) {
+    if (slave < 1 || slave > slave_count_) { detail = "从站序号越界"; return false; }
+    std::uint32_t vendor = 0, product = 0;
+    std::uint16_t status = 0;
+    if (!read_sdo(slave, 0x1018, 1, vendor)) {
+        detail = "读取 Vendor ID (0x1018:01) 失败"; return false;
+    }
+    if (vendor != 0x75500) {
+        std::ostringstream identity;
+        identity << "仅支持同川 Vendor=0x75500；实际 Vendor=0x" << std::hex << vendor;
+        detail = identity.str(); return false;
+    }
+    // 同川各关节使用不同 Product Code；记录产品身份，不作为型号白名单限制。
+    if (!read_sdo(slave, 0x1018, 2, product)) {
+        detail = "读取 Product Code (0x1018:02) 失败"; return false;
+    }
+    ecx_readstate(&context_);
+    if (context_.slavelist[slave].state != EC_STATE_PRE_OP ||
+        !read_sdo(slave, 0x6041, 0, status) || (status & 4)) {
+        detail = "要求 PREOP 且驱动未处于 Operation Enabled"; return false;
+    }
+    const std::vector<std::vector<std::uint32_t>> desired{
+        {0x60400010, 0x607a0020, 0x60ff0020, 0x60710010, 0x60b10020, 0x60600008},
+        {0x60410010, 0x60610008, 0x60640020, 0x606c0020, 0x60770010,
+         0x60f40020, 0x603f0010, 0x60790020, 0x300f0010}};
+    const std::uint16_t assignments[]{0x1c12, 0x1c13};
+    const std::uint16_t maps[]{0x1601, 0x1a01};
+    std::ostringstream snapshot;
+    snapshot << "slave " << slave << " vendor " << vendor << " product " << product << '\n';
+    bool matches[2]{true, true};
+    // 两侧全部读取成功并持久化备份后，才允许执行第一次写入。
+    for (int side = 0; side < 2; ++side) {
+        std::uint8_t count = 0;
+        if (!read_sdo(slave, assignments[side], 0, count)) { detail = "读取 PDO 分配失败"; return false; }
+        matches[side] = count == 1;
+        snapshot << std::hex << assignments[side] << ":0 " << unsigned(count) << '\n';
+        std::vector<std::uint16_t> indices;
+        for (unsigned n = 1; n <= count; ++n) {
+            std::uint16_t index = 0;
+            if (!read_sdo(slave, assignments[side], n, index)) { detail = "读取 PDO 索引失败"; return false; }
+            indices.push_back(index);
+            snapshot << assignments[side] << ':' << n << ' ' << index << '\n';
+            matches[side] = matches[side] && index == maps[side];
+        }
+        // 即使目标映射当前未被分配，也备份即将覆盖的对象。
+        if (std::find(indices.begin(), indices.end(), maps[side]) == indices.end()) indices.push_back(maps[side]);
+        for (auto index : indices) {
+            std::uint8_t entries = 0;
+            if (!read_sdo(slave, index, 0, entries)) { detail = "读取映射数量失败"; return false; }
+            snapshot << index << ":0 " << unsigned(entries) << '\n';
+            if (index == maps[side]) matches[side] = matches[side] && entries == desired[side].size();
+            for (unsigned n = 1; n <= entries; ++n) {
+                std::uint32_t value = 0;
+                if (!read_sdo(slave, index, n, value)) { detail = "读取映射条目失败"; return false; }
+                snapshot << index << ':' << n << ' ' << value << '\n';
+                if (index == maps[side]) matches[side] = matches[side] && n <= desired[side].size() && value == desired[side][n-1];
+            }
+        }
+    }
+    std::cout << snapshot.str();
+    detail = std::string("RxPDO(17B): ") + (matches[0] ? "一致" : "需重写") +
+             "; TxPDO(25B): " + (matches[1] ? "一致" : "需重写");
+    if (!apply || (matches[0] && matches[1] && !save)) return true;
+    const auto data = snapshot.str();
+    if (backup.empty() || !save_pdo_backup(backup, std::vector<std::uint8_t>(data.begin(), data.end()), detail)) return false;
+    for (int side = 0; side < 2; ++side) {
+        if (matches[side]) continue;
+        std::string failure;
+        auto fail = [&](const char* operation, std::uint16_t index, unsigned sub) {
+            std::ostringstream out;
+            out << operation << " 0x" << std::hex << index << ':' << sub;
+            while (ecx_iserror(&context_)) out << "\n" << ecx_elist2string(&context_);
+            failure = out.str();
+            return false;
+        };
+        // 清除之前只读探测遗留的错误，后续只报告本次操作的错误队列。
+        while (ecx_iserror(&context_)) (void)ecx_elist2string(&context_);
+        auto write_checked = [&](std::uint16_t index, std::uint8_t sub, auto value) {
+            if (stop_requested_.load()) return fail("用户中断", index, sub);
+            if (!write_sdo(slave, index, sub, value)) return fail("SDO 写入失败", index, sub);
+            // 同川在 SI0=0 时可能隐藏映射条目；写入确认后，等待激活再统一回读。
+            if (index == maps[side] && sub != 0) return true;
+            decltype(value) actual{};
+            if (!read_sdo(slave, index, sub, actual)) return fail("SDO 回读失败", index, sub);
+            if (actual != value) {
+                fail("SDO 回读不一致", index, sub);
+                failure += " expected=" + std::to_string(value) + " actual=" + std::to_string(actual);
+                return false;
+            }
+            return true;
+        };
+        // 与此前同川 EC-Master 的已验证序列一致：分配对象使用 Complete Access，
+        // SI0 占两个字节；映射对象仍逐条写入。不在失败后尝试另一种写法。
+        auto assign = [&](bool enable) {
+            if (stop_requested_.load()) return fail("用户中断", assignments[side], 0);
+            std::uint8_t payload[]{static_cast<std::uint8_t>(enable), 0,
+                static_cast<std::uint8_t>(maps[side] & 0xff),
+                static_cast<std::uint8_t>(maps[side] >> 8)};
+            if (ecx_SDOwrite(&context_, slave, assignments[side], 0, TRUE,
+                             enable ? 4 : 2, payload, EC_TIMEOUTRXM) <= 0)
+                return fail("CA 分配写入失败", assignments[side], 0);
+            std::uint8_t count = 0;
+            if (!read_sdo(slave, assignments[side], 0, count) || count != unsigned(enable))
+                return fail("CA 分配数量回读失败或不一致", assignments[side], 0);
+            std::uint16_t index = 0;
+            if (enable && (!read_sdo(slave, assignments[side], 1, index) || index != maps[side]))
+                return fail("CA 分配索引回读失败或不一致", assignments[side], 1);
+            return true;
+        };
+        bool ok = assign(false) && write_checked(maps[side], 0, std::uint8_t{0});
+        for (unsigned n = 0; ok && n < desired[side].size(); ++n)
+            ok = write_checked(maps[side], n+1, desired[side][n]);
+        ok = ok && write_checked(maps[side], 0, static_cast<std::uint8_t>(desired[side].size()));
+        // 激活映射数量后再逐条校验；所有条目正确才重新启用 SM 分配。
+        for (unsigned n = 0; ok && n < desired[side].size(); ++n) {
+            std::uint32_t actual = 0;
+            if (!read_sdo(slave, maps[side], n+1, actual))
+                ok = fail("激活后映射回读失败", maps[side], n+1);
+            else if (actual != desired[side][n]) {
+                ok = fail("激活后映射回读不一致", maps[side], n+1);
+                failure += " expected=" + std::to_string(desired[side][n]) +
+                           " actual=" + std::to_string(actual);
+            }
+        }
+        ok = ok && assign(true);
+        if (!ok) {
+            detail = failure + "\n可能已部分修改；保留 PREOP，原映射备份: " + backup;
+            return false;
+        }
+    }
+    std::string verified;
+    if (!configure_tongchuan_pdo(slave, false, "", verified) || verified.find("需重写") != std::string::npos) {
+        detail = "最终 PDO 回读不一致；原映射备份: " + backup; return false;
+    }
+    if (save) {
+        // Pr1.61=33：保存 0x1000 系列；不使用会保存其他参数的 88。
+        // 保存写入可能耗时，使用 5 秒邮箱超时；结果不明确时不自动重试。
+        std::uint16_t status_now = 0;
+        ecx_readstate(&context_);
+        if (stop_requested_.load() || context_.slavelist[slave].state != EC_STATE_PRE_OP ||
+            !read_sdo(slave, 0x6041, 0, status_now) || (status_now & 4)) {
+            detail = "映射已校验，但保存前状态检查失败，未发送保存命令"; return false;
+        }
+        while (ecx_iserror(&context_)) (void)ecx_elist2string(&context_);
+        std::uint16_t command = htoes(33);
+        if (ecx_SDOwrite(&context_, slave, 0x313d, 0, FALSE, sizeof(command),
+                         &command, 5000000) <= 0) {
+            detail = "映射已校验，但 0x313D:00=33 保存命令失败或结果不明确；不要自动重试";
+            while (ecx_iserror(&context_)) detail += std::string("\n") + ecx_elist2string(&context_);
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        std::string after_save;
+        if (!configure_tongchuan_pdo(slave, false, "", after_save) ||
+            after_save.find("需重写") != std::string::npos) {
+            detail = "保存命令已应答，但保存后映射检查失败：" + after_save; return false;
+        }
+        detail = "PDO SAVE ACK: Rx=17B Tx=25B；0x313D:00=33 已应答，保存后映射一致；待断电重启验证永久保留";
+        return true;
+    }
+    detail = "PDO WRITE PASS: Rx=17B Tx=25B；未保存 Flash，未进行周期数据验证";
     return true;
 }
 

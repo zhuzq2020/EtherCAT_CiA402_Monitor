@@ -10,6 +10,8 @@
 #include <cstdint>
 #include <cstring>
 #include <sstream>
+#include <set>
+#include <filesystem>
 
 namespace {
 
@@ -30,6 +32,27 @@ bool parse_object_address(const std::string& text, unsigned max, unsigned& resul
     } catch (const std::exception&) {
         return false;
     }
+}
+
+// 严格解析物理从站列表，拒绝重复、倒序范围和空项。
+bool parse_slave_list(const std::string& text, std::vector<int>& result) {
+    if (text.empty() || text.back() == ',') return false;
+    std::set<unsigned> seen;
+    std::istringstream input(text);
+    std::string token;
+    while (std::getline(input, token, ',')) {
+        const auto dash = token.find('-');
+        unsigned first = 0, last = 0;
+        if (!parse_object_address(token.substr(0, dash), 65535, first) || first == 0) return false;
+        last = first;
+        if (dash != std::string::npos &&
+            (!parse_object_address(token.substr(dash+1), 65535, last) || last < first)) return false;
+        for (unsigned n = first; n <= last; ++n) {
+            if (!seen.insert(n).second) return false;
+            result.push_back(static_cast<int>(n));
+        }
+    }
+    return !result.empty();
 }
 
 std::string format_sdo_value(const std::vector<std::uint8_t>& bytes) {
@@ -84,6 +107,8 @@ void show_help() {
               << "  5. read-pos           快速读取单轴或全臂当前编码器实际脉冲位置\n"
               << "       --axis <Dxx|1..N>  读取指定轴\n"
               << "       --all              读取全部轴\n"
+              << "  configure-pdo --slaves 2-8,10-16 [--confirm --backup-dir DIR] [--save]  批量对齐 PDO\n"
+              << "  configure-pdo --slave N [--confirm --backup FILE] [--save]  对齐同川 lagbotwbc PDO，默认只读比较\n"
               << "  6. read-sdo           读取指定 CoE 对象，默认读取全部从站\n"
               << "       --index <0xHHHH>   对象索引（必填，如 0x6064）\n"
               << "       --subindex <0..255> 子索引（默认 0，也可用 0x 格式）\n"
@@ -138,7 +163,10 @@ int main(int argc, char** argv) {
     std::string target_axis;
     bool all_axes = false;
     bool confirmed = false;
+    bool pdo_save = false;
     std::string confirmation_phrase;
+    std::vector<int> pdo_slaves;
+    std::string pdo_backup_dir;
     int alias_slave = -1;
     int alias_value = -1;
     std::string backup_path;
@@ -169,6 +197,8 @@ int main(int argc, char** argv) {
             }
             if (is_index) { sdo_index = parsed; has_sdo_index = true; }
             else sdo_subindex = parsed;
+        } else if (arg == "--save") {
+            pdo_save = true;
         } else if (arg == "--all") {
             all_axes = true;
         } else if (arg == "--confirm") {
@@ -176,6 +206,14 @@ int main(int argc, char** argv) {
             if (i + 1 < argc && std::string(argv[i + 1]) == "WRITE-EEPROM-ALIAS") {
                 confirmation_phrase = argv[++i];
             }
+        } else if (arg == "--slaves") {
+            if (!pdo_slaves.empty() || ++i >= argc || !parse_slave_list(argv[i], pdo_slaves)) {
+                std::cerr << "--slaves requires a unique list/range, e.g. 2-8 or 2,3,5\n";
+                return 1;
+            }
+        } else if (arg == "--backup-dir") {
+            if (++i >= argc || std::string(argv[i]).empty() || !pdo_backup_dir.empty()) return 1;
+            pdo_backup_dir = argv[i];
         } else if (arg == "--slave" || arg == "--alias") {
             unsigned parsed = 0;
             if (++i >= argc || !parse_object_address(argv[i], 0xffffU, parsed) || parsed == 0) {
@@ -202,7 +240,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    if (command != "status" && command != "clear-fault" && command != "set-zero" && command != "read-pos" && command != "read-sdo" && command != "jog" && command != "write-alias" && command != "read-alias" && command != "backup-sii" && command != "enable" && command != "disable") {
+    if (command != "configure-pdo" && command != "status" && command != "clear-fault" && command != "set-zero" && command != "read-pos" && command != "read-sdo" && command != "jog" && command != "write-alias" && command != "read-alias" && command != "backup-sii" && command != "enable" && command != "disable") {
         std::cerr << "[错误] 未知命令: " << command << "，输入 --help 查看支持命令。\n";
         return 1;
     }
@@ -263,6 +301,22 @@ int main(int argc, char** argv) {
         }
     }
 
+    if (pdo_save && (command != "configure-pdo" || !confirmed)) {
+        std::cerr << "--save 仅用于 configure-pdo，且必须同时指定 --confirm 和备份路径\n";
+        return 1;
+    }
+    if (!pdo_slaves.empty() || !pdo_backup_dir.empty()) {
+        if (command != "configure-pdo" || pdo_slaves.empty() || alias_slave > 0 ||
+            !backup_path.empty() || (confirmed && pdo_backup_dir.empty())) {
+            std::cerr << "批量 PDO 使用 configure-pdo --slaves 2-8 [--confirm --backup-dir DIR]；不能混用 --slave/--backup\n";
+            return 1;
+        }
+    } else if (command == "configure-pdo" &&
+               (alias_slave <= 0 || (confirmed && backup_path.empty()))) {
+        std::cerr << "configure-pdo requires --slave; applying with --confirm also requires --backup\n";
+        return 1;
+    }
+
     // A running PDO owner must never be rescanned by another CLI invocation.
     std::string service_reply;
     std::string read_request = "status";
@@ -289,6 +343,46 @@ int main(int argc, char** argv) {
     }
 
     const int total_slaves = engine.slave_count();
+
+    if (command == "configure-pdo") {
+        if (pdo_slaves.empty()) pdo_slaves.push_back(alias_slave);
+        // 先对全部目标只读预检，避免发现后续无效目标时前面的电机已经写入。
+        for (int slave : pdo_slaves) {
+            std::string detail;
+            if (!engine.configure_tongchuan_pdo(slave, false, "", detail)) {
+                std::cerr << "[FAIL] slave " << slave << ": " << detail << '\n';
+                return 1;
+            }
+            std::cout << "[CHECK] slave " << slave << ": " << detail << '\n';
+        }
+        if (!confirmed) return 0;
+        if (!pdo_backup_dir.empty()) {
+            std::error_code error;
+            // 批次目录必须新建，防止重复执行时混入以前的备份。
+            if (!std::filesystem::create_directory(pdo_backup_dir, error)) {
+                std::cerr << "无法新建批次备份目录（父目录须存在，拒绝复用）: " << pdo_backup_dir
+                          << " " << error.message() << '\n';
+                return 1;
+            }
+        }
+        unsigned completed = 0;
+        for (int slave : pdo_slaves) {
+            const std::string path = pdo_backup_dir.empty() ? backup_path :
+                (std::filesystem::path(pdo_backup_dir) / ("slave" + std::to_string(slave) + "-pdo-before.txt")).string();
+            std::string detail;
+            const bool ok = engine.configure_tongchuan_pdo(slave, true, path, detail, pdo_save);
+            std::cout << (ok ? "[PASS]" : "[FAIL]") << " slave " << slave << ": " << detail << '\n';
+            if (!ok) {
+                std::cerr << "批次停止，已完成 " << completed << "/" << pdo_slaves.size()
+                          << "；此前成功的电机不自动回滚，后续电机未写入。\n";
+                return 1;
+            }
+            ++completed;
+        }
+        if (pdo_save) std::cout << "保存命令均已应答；断电保留仍需安全重新上电后只读验证。\n";
+        std::cout << "PDO batch PASS: " << completed << " slaves\n";
+        return 0;
+    }
 
     // 1. STATUS
     if (command == "status") {

@@ -47,7 +47,7 @@ chmod +x scripts/*.sh
 ```bash
 sudo ./build/arm_maint status
 # 或指定网卡名:
-sudo ./build/arm_maint status -i enp2s0
+sudo ./build/arm_maint status -i eno0
 ```
 
 ### 2. 清除驱动器故障报警
@@ -114,8 +114,8 @@ sudo ./build/arm_maint read-sdo --all --index 0x6041
 工具按 SII 声明容量读取完整 EEPROM，核对 Vendor ID/Product Code，独占新建备份并同步到磁盘后才开始写入。意优型号通过 `0x2679` 临时打开写权限；同川使用标准 SII 流程，不调用意优解锁或 `0x313D` 全参数保存。
 
 ```bash
-sudo ./build/arm_maint status -i enp2s0
-sudo ./build/arm_maint write-alias -i enp2s0 \
+sudo ./build/arm_maint status -i eno0
+sudo ./build/arm_maint write-alias -i eno0 \
   --slave 1 --alias 18 \
   --backup ./backups/d18-sii-before-alias.bin \
   --confirm WRITE-EEPROM-ALIAS
@@ -181,3 +181,56 @@ sudo ./build/arm_maint disable -i eno0 --all
 新增流程已通过模拟 PDO 的多轴原子校验、握手、运动规划、错误轴名、取消/失能和通信异常测试，以及 Unix 套接字 CLI 测试。尚未进行实机使能/运动验证；本次开发没有向电机发送使能或运动指令。
 
 升级含不同位移列表的版本后，若旧后台服务仍在运行，先执行 `disable -i eno0 --all`，再用新版 `enable` 重新启动。仅替换可执行文件不会改变已经运行的旧进程；不要在使能保持期间直接删除套接字或杀进程来升级。
+
+## 同川 PDO 配置（SOEM）
+
+`configure-pdo` 对齐 lagbotwbc 的同川机械臂映射，仅处理指定物理从站，
+不根据 D 编号或 Alias 猜测目标。默认只读比较并打印原始映射；
+追加 `--confirm --backup` 后，先独占创建并 fsync 文本备份，再仅修改不一致的一侧。
+命令复用维护程序的网口独占锁，要求 PREOP、同川 Vendor=0x75500（读取并记录 Product Code，不限制产品编号），
+且驱动未处于 Operation Enabled。检查每次写入结果，激活映射数量后逐条回读（SI0=0 时固件可能隐藏条目），失败立即停止；可能留下部分映射，
+应保留日志和备份，不自动重试。不会使能电机、发送运动 PDO 或自动保存 Flash。
+
+`--slaves` 支持物理从站范围与列表（`2`、`2-8`、`2,3,5`、`2-8,10-16`），
+拒绝重复和倒序范围。先对全部目标做只读身份、状态、映射预检，通过后依次写入。
+任何一台失败立即停止，已完成的电机不回滚，后续电机不写入。
+批次不是原子操作；仍要求电机未使能，并由本程序独占网口。
+
+```bash
+# 按当前拓扑检查左臂；右臂为 10-16，1、9 不是电机
+sudo ./build/arm_maint configure-pdo -i eno0 --slaves 2-8
+# 写入左臂；父目录 backups 须存在，批次目录必须不存在
+sudo ./build/arm_maint configure-pdo -i eno0 --slaves 2-8 \
+  --confirm --backup-dir ./backups/left-arm-pdo-batch1
+```
+
+目标 RxPDO 0x1601（17 字节），各对象子索引均为 0：
+6040:16、607A:32、60FF:32、6071:16、60B1:32、6060:8。
+目标 TxPDO 0x1A01（25 字节）：
+6041:16、6061:8、6064:32、606C:32、6077:16、60F4:32、603F:16、6079:32、300F:16。
+分别由 0x1C12、0x1C13 分配。Rx 已一致时只重写 Tx；两侧都一致时不写入。
+
+依据《TCHL_ECat协议说明书V2.0.8》7.5.3，每组允许最多 10 个映射条目。
+手册 Pr1.61/0x313D 列出 33（0x1000 系列保存）与 88（所有参数保存），
+但未明确逐项保证 PDO 映射的断电保留；默认不调用这些保存操作；显式保存选项见下文。
+手册映射数量子索引的 RO 标注与已有 EC-Master 逐条重映射实践存在差异，
+需要在新臂固件上实测写入能力；命令失败不会绕过错误继续写。
+`PDO WRITE PASS` 仅表示当前映射回读一致，不代表 SAFEOP/OP 周期通信或断电保留验证通过。
+生产使用应由主站启动阶段配置并核验 PDO，或另行验证厂商保存机制。
+
+### 保存 PDO 所在的 0x1000 系列参数
+
+显式添加 `--save` 会在映射校验成功后向 Pr1.61 `0x313D:00` 写入
+**UINT16 十进制 33**，请求保存 0x1000 系列参数。该选项要求 `--confirm`
+与备份路径；默认仍只修改运行时映射。即使映射已经一致，`--save` 也会先备份
+当前映射再发送保存命令，不能因“一致”而跳过保存。
+注意 33 的保存范围是整个 0x1000 系列，不只本次修改的 PDO。
+
+```bash
+# 建议先单台验证断电保留，使用全新的备份文件
+sudo ./build/arm_maint configure-pdo -i eno0 --slave 2 \
+  --confirm --backup ./backups/slave2-before-save.txt --save
+# 单台断电验证通过后，可批量保存，使用全新的批次目录
+sudo ./build/arm_maint configure-pdo -i eno0 --slaves 2-8,10-16 \
+  --confirm --backup-dir ./backups/arm-pdo-save-batch1 --save
+```
