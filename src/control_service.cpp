@@ -12,6 +12,8 @@
 #include <iostream>
 #include <limits>
 #include <poll.h>
+#include <sched.h>
+#include <sys/mman.h>
 #include <net/if.h>
 #include <set>
 #include <sstream>
@@ -54,6 +56,7 @@ std::string encode(const ControlOptions& o) {
         for(std::size_t i=0;i<o.deltas.size();++i){if(i)out<<',';out<<o.deltas[i];}
         out<<" --speed_rpm "<<o.rpm;
     }
+    if(o.command=="move-zero")out<<" --speed_rpm "<<std::setprecision(17)<<o.rpm;
     return out.str();
 }
 void reply(int fd,bool ok,const std::string& message) {
@@ -76,6 +79,7 @@ int service(const std::string& iface,int lock_fd,int ready_fd,const std::vector<
     service_stop=0;std::signal(SIGINT,stop_service);std::signal(SIGTERM,stop_service);std::signal(SIGHUP,SIG_IGN);
     std::signal(SIGPIPE,SIG_IGN);::prctl(PR_SET_NAME,"arm_maint_pdo",0,0,0);
     auto startup_error=[&](const std::string& message){
+        std::cerr<<"[启动失败] "<<message<<'\n';
         const auto s="ERR "+message+"\n";
         if(::write(ready_fd,s.data(),s.size())!=static_cast<ssize_t>(s.size()))
             std::cerr<<"无法发送启动错误通知\n";
@@ -85,6 +89,17 @@ int service(const std::string& iface,int lock_fd,int ready_fd,const std::vector<
     MotionControl control(bus.info());std::vector<MotionFeedback> feedback;
     if(!bus.cycle(control.outputs(),feedback)){startup_error("初始 PDO 反馈无效");return 1;}
     control.update(feedback,true);
+    std::cerr<<"[启动] 在失能状态下连续验证 PDO 通信 1 秒\n";
+    auto warmup_next=std::chrono::steady_clock::now();
+    for(int n=0;n<500;++n) {
+        if(service_stop){startup_error("启动验证被中断");return 1;}
+        if(!bus.cycle(control.outputs(),feedback)) {
+            startup_error("失能状态 PDO 验证失败，WKC="+std::to_string(bus.last_wkc())
+                          +" expected="+std::to_string(bus.expected_wkc())+"；"+bus.diagnostics());return 1;
+        }
+        control.update(feedback,true);
+        warmup_next+=std::chrono::milliseconds(2);std::this_thread::sleep_until(warmup_next);
+    }
     const int listener=::socket(AF_UNIX,SOCK_STREAM|SOCK_CLOEXEC|SOCK_NONBLOCK,0);
     if(listener<0){startup_error("创建控制套接字失败");return 1;}
     sockaddr_un address{};address.sun_family=AF_UNIX;const auto path=socket_path(iface);
@@ -95,16 +110,38 @@ int service(const std::string& iface,int lock_fd,int ready_fd,const std::vector<
         startup_error("绑定控制套接字失败");::close(listener);return 1;
     }
     ::chmod(path.c_str(),0600);
+    // Keep cyclic traffic responsive to normal desktop workloads. Failure to
+    // obtain these privileges is visible; communication protections stay active.
+    if(::mlockall(MCL_CURRENT)!=0)
+        std::cerr<<"[调度] 锁定当前内存失败: "<<std::strerror(errno)<<'\n';
+    else std::cerr<<"[调度] 已锁定当前内存\n";
+    sched_param scheduling{};scheduling.sched_priority=10;
+    if(::sched_setscheduler(0,SCHED_FIFO,&scheduling)!=0)
+        std::cerr<<"[调度] 设置 SCHED_FIFO/10 失败: "<<std::strerror(errno)<<'\n';
+    else std::cerr<<"[调度] 使用 SCHED_FIFO/10\n";
     const std::string ready="READY "+std::to_string(::getpid())+"\n";
     const bool notified=::write(ready_fd,ready.data(),ready.size())==static_cast<ssize_t>(ready.size());
     ::close(ready_fd);
     if(!notified){::close(listener);::unlink(path.c_str());return 1;}
-    std::vector<Client> clients;auto next=std::chrono::steady_clock::now();bool finish=false;
+    std::vector<Client> clients;clients.reserve(16);auto next=std::chrono::steady_clock::now();bool finish=false;
     int final_reply_fd=-1;std::string final_reply;
+    const auto running_since=std::chrono::steady_clock::now();
+    std::uint64_t cycles=0;std::int64_t max_cycle_us=0,max_late_us=0;
     while(!service_stop&&!finish) {
         const auto now=std::chrono::steady_clock::now();
-        const bool late=now-next>std::chrono::milliseconds(20)&&control.any_active();
+        const auto late_us=std::chrono::duration_cast<std::chrono::microseconds>(now-next).count();
+        const bool late=late_us>20000&&control.any_active();
         const bool healthy=bus.cycle(control.outputs(),feedback);
+        ++cycles;max_cycle_us=std::max(max_cycle_us,bus.last_cycle_us());
+        max_late_us=std::max(max_late_us,static_cast<std::int64_t>(late_us));
+        if(!healthy||late) {
+            const auto elapsed=std::chrono::duration_cast<std::chrono::milliseconds>(now-running_since).count();
+            std::cerr<<"[异常停止] PID="<<::getpid()<<" elapsed_ms="<<elapsed<<" cycle="<<cycles
+                     <<" "<<bus.diagnostics()
+                     <<" exchange_us="<<bus.last_cycle_us()<<" late_us="<<late_us
+                     <<" max_exchange_us="<<max_cycle_us<<" max_late_us="<<max_late_us
+                     <<" reason="<<(!healthy?"WKC不足":"周期延迟超过20ms")<<'\n';
+        }
         control.update(feedback,healthy);
         if(late)control.stop_all("PDO 周期延迟超过 20ms，停止全部目标");
         for(unsigned n=0;n<8;++n) {
@@ -116,7 +153,7 @@ int service(const std::string& iface,int lock_fd,int ready_fd,const std::vector<
             Client client;client.fd=fd;clients.push_back(std::move(client));
         }
         for(auto& client:clients) {
-            if(finish){reply(client.fd,false,"disable --all 正在关闭服务");::close(client.fd);client.fd=-1;continue;}
+            if(finish){reply(client.fd,false,"PDO 服务正在失能关闭");::close(client.fd);client.fd=-1;continue;}
             char data[512];const auto got=::recv(client.fd,data,sizeof(data),MSG_DONTWAIT);
             if(got==0||(got<0&&errno!=EAGAIN&&errno!=EWOULDBLOCK&&errno!=EINTR)) {
                 if(client.pending)control.abort(client.ticket,"请求客户端断开，已取消并失能目标");
@@ -132,7 +169,7 @@ int service(const std::string& iface,int lock_fd,int ready_fd,const std::vector<
             }
             if(!client.pending&&client.input.find('\n')!=std::string::npos) {
                 const auto line=client.input.substr(0,client.input.find('\n'));
-                if(line=="status"||line=="read-pos") {reply(client.fd,true,"PDO 服务 PID="+std::to_string(::getpid())+"\n"+control.status());::close(client.fd);client.fd=-1;continue;}
+                if(line=="status"||line=="read-pos") {reply(client.fd,true,"PDO 服务 PID="+std::to_string(::getpid())+"\n"+bus.diagnostics()+"\n"+control.status());::close(client.fd);client.fd=-1;continue;}
                 if(line.rfind("read-pos ",0)==0) {
                     std::vector<std::string> labels;std::string label;
                     std::istringstream list(line.substr(9));
@@ -144,17 +181,27 @@ int service(const std::string& iface,int lock_fd,int ready_fd,const std::vector<
                 }
                 ControlOptions options;std::vector<int> ids;
                 bool accepted=parse_control_options(words(line),options,error);
-                if(accepted&&options.all) {
+                if(accepted&&options.command=="start-pdo") {
+                    int available=0;
+                    for(const auto& axis:control.info())if(axis.unavailable.empty())++available;
+                    reply(client.fd,true,"[PDO 通信已建立] 可控制伺服="+std::to_string(available)
+                          +"；本命令不执行使能\n"+bus.diagnostics()+"\n"+control.status());
+                    ::close(client.fd);client.fd=-1;continue;
+                }
+                if(accepted&&options.command=="stop-pdo") {
+                    for(int i=0;i<control.size();++i)if(control.info()[i].unavailable.empty())ids.push_back(i);
+                } else if(accepted&&options.all) {
                     for(int i=0;i<control.size();++i)if(control.info()[i].unavailable.empty())ids.push_back(i);
                 } else if(accepted)accepted=resolve_motion_axes(options.axes,control.size(),ids,error);
                 if(accepted) {
                     if(options.command=="enable")accepted=control.enable(ids,client.ticket,error);
                     else if(options.command=="jog-enabled")accepted=control.jog(ids,options.degrees,options.deltas,options.rpm,client.ticket,error);
-                    else if(options.command=="disable")accepted=control.disable(ids,client.ticket,error);
+                    else if(options.command=="move-zero")accepted=control.move_zero(ids,options.rpm,client.ticket,error);
+                    else if(options.command=="disable"||options.command=="stop-pdo")accepted=control.disable(ids,client.ticket,error);
                     else {accepted=false;error="不支持的控制命令";}
                 }
                 if(!accepted){reply(client.fd,false,error);::close(client.fd);client.fd=-1;continue;}
-                client.pending=true;client.shutdown=options.command=="disable"&&options.all;
+                client.pending=true;client.shutdown=options.command=="stop-pdo"||(options.command=="disable"&&options.all);
             }
             if(!client.pending&&now-client.connected>std::chrono::seconds(2)) {
                 reply(client.fd,false,"请求过长或不完整");::close(client.fd);client.fd=-1;continue;
@@ -165,7 +212,7 @@ int service(const std::string& iface,int lock_fd,int ready_fd,const std::vector<
                     if(client.shutdown&&result>0) {
                         // Successful --all replies only after PDO shutdown and
                         // interface-lock release, allowing immediate maintenance.
-                        final_reply_fd=client.fd;final_reply=error;finish=true;
+                        final_reply_fd=client.fd;final_reply=error+(client.shutdown?"；[PDO 通信已停止] 网口已释放":"");finish=true;
                     } else {reply(client.fd,result>0,error);::close(client.fd);}
                     client.fd=-1;
                 }
@@ -177,6 +224,8 @@ int service(const std::string& iface,int lock_fd,int ready_fd,const std::vector<
         if(std::chrono::steady_clock::now()>next+std::chrono::milliseconds(20))next=std::chrono::steady_clock::now();
         std::this_thread::sleep_until(next);
     }
+    std::cerr<<"[服务退出] PID="<<::getpid()<<" cycles="<<cycles<<" signal="<<service_stop
+             <<" max_exchange_us="<<max_cycle_us<<" max_late_us="<<max_late_us<<'\n';
     control.stop_all("PDO 服务停止");
     for(auto& client:clients){reply(client.fd,false,"PDO 服务停止，目标轴正在失能");::close(client.fd);}
     ::close(listener);::unlink(path.c_str());
@@ -197,17 +246,65 @@ bool launch(const ControlOptions& initial,InterfaceLock& lock,std::string& error
         const auto log=directory()+"/"+iface+".log";
         const int fd=::open(log.c_str(),O_WRONLY|O_CREAT|O_APPEND|O_NOFOLLOW,0600);
         if(fd>=0){::dup2(fd,STDOUT_FILENO);::dup2(fd,STDERR_FILENO);::close(fd);}
+        // _exit bypasses iostream destruction; flush every startup diagnostic.
+        std::cout<<std::unitbuf;std::cerr<<std::unitbuf;
+        std::cerr<<"[启动] PDO 服务 PID="<<::getpid()<<" 网口="<<iface<<'\n';
         int result=1;
         try { result=service(iface,lock.fd(),pipefd[1],initial.axes); }
-        catch(const std::exception& e){std::cerr<<"PDO 服务异常: "<<e.what()<<'\n';}
+        catch(const std::exception& e){
+            const std::string message=std::string("ERR PDO 服务异常: ")+e.what()+"\n";
+            std::cerr<<message;
+            if(::write(pipefd[1],message.data(),message.size())!=static_cast<ssize_t>(message.size()))
+                std::cerr<<"无法发送启动异常通知\n";
+        }
         ::_exit(result);
     }
-    ::close(pipefd[1]);pollfd p{pipefd[0],POLLIN,0};
-    const int ready=::poll(&p,1,20000);char buffer[512]{};
-    const auto n=ready>0?::read(pipefd[0],buffer,sizeof(buffer)-1):-1;::close(pipefd[0]);
-    if(n<=0||std::string(buffer).rfind("READY ",0)!=0) {
-        error=n>0?std::string(buffer):"PDO 服务启动超时，请检查后台日志";
-        ::kill(pid,SIGTERM);(void)::waitpid(pid,nullptr,WNOHANG);return false;
+    ::close(pipefd[1]);
+    // Large buses perform many sequential mailbox reads before the listener exists.
+    // Use a deadline and retry EINTR rather than treating an interrupted poll as timeout.
+    const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(120);
+    std::string notification;bool timed_out=false;bool read_failed=false;
+    while(notification.find('\n')==std::string::npos&&notification.size()<4096) {
+        const auto remaining=std::chrono::duration_cast<std::chrono::milliseconds>(deadline-std::chrono::steady_clock::now()).count();
+        if(remaining<=0){timed_out=true;break;}
+        pollfd p{pipefd[0],POLLIN,0};
+        const int ready=::poll(&p,1,static_cast<int>(remaining));
+        if(ready<0){if(errno==EINTR)continue;read_failed=true;break;}
+        if(ready==0){timed_out=true;break;}
+        char buffer[512];const auto n=::read(pipefd[0],buffer,sizeof(buffer));
+        if(n<0){if(errno==EINTR)continue;read_failed=true;break;}
+        if(n==0)break;
+        notification.append(buffer,static_cast<std::size_t>(n));
+    }
+    ::close(pipefd[0]);
+    if(notification.rfind("READY ",0)!=0||notification.find('\n')==std::string::npos) {
+        if(notification.rfind("ERR ",0)==0)error=notification.substr(4);
+        else if(timed_out)error="PDO 服务启动超过 120 秒";
+        else if(read_failed)error="读取 PDO 服务启动通知失败";
+        else error="PDO 服务在就绪前退出，未收到完整启动通知";
+        // EOF can precede the child becoming waitable by a few instructions.
+        // Reap before signalling, preserving the actual crash/exit status.
+        bool reaped=false;
+        for(int attempt=0;attempt<20;++attempt) {
+            int status=0;const auto waited=::waitpid(pid,&status,WNOHANG);
+            if(waited==pid) {
+                reaped=true;
+                if(WIFSIGNALED(status))
+                    error+="；子进程被信号 "+std::to_string(WTERMSIG(status))+" ("+::strsignal(WTERMSIG(status))+") 终止";
+                else if(WIFEXITED(status))error+="；子进程退出码="+std::to_string(WEXITSTATUS(status));
+                break;
+            }
+            if(waited<0){if(errno==EINTR)continue;if(errno==ECHILD)reaped=true;break;}
+            if(timed_out||read_failed)break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        error+="；后台日志: "+directory()+"/"+iface+".log";
+        // An ERR notification means the child is unwinding and performing its
+        // Shutdown sequence. Let it release the bus instead of interrupting it.
+        if(!reaped&&notification.rfind("ERR ",0)!=0) {
+            ::kill(pid,SIGTERM);(void)::waitpid(pid,nullptr,WNOHANG);
+        }
+        return false;
     }
     return true;
 }
@@ -250,7 +347,7 @@ bool parse_control_options(const std::vector<std::string>& args,ControlOptions& 
     try {
         for(std::size_t i=0;i<args.size();++i) {
             const auto& arg=args[i];auto value=[&](){if(++i>=args.size())throw std::runtime_error(arg+" 缺少参数");return args[i];};
-            if(arg=="enable"||arg=="disable"||arg=="jog-enabled") {if(!o.command.empty())throw std::runtime_error("重复命令");o.command=arg;}
+            if(arg=="enable"||arg=="disable"||arg=="jog-enabled"||arg=="move-zero"||arg=="start-pdo"||arg=="stop-pdo") {if(!o.command.empty())throw std::runtime_error("重复命令");o.command=arg;}
             else if(arg=="-i"||arg=="--iface")o.iface=value();
             else if(arg=="--axis") {
                 const auto text=value();
@@ -284,15 +381,21 @@ bool parse_control_options(const std::vector<std::string>& args,ControlOptions& 
             } else throw std::runtime_error("未知参数: "+arg+"；多轴使用 --axis D18,D19 或重复 --axis");
         }
         if(o.command.empty()||!valid_iface(o.iface))throw std::runtime_error("命令或网卡名称无效");
-        if((o.axes.empty()&&!o.all)||(!o.axes.empty()&&o.all))throw std::runtime_error("必须指定 --axis，且不能与 --all 混用");
-        if(o.all&&o.command!="disable")throw std::runtime_error("enable/jog-enabled 请显式列出目标轴");
+        if(o.command=="start-pdo"||o.command=="stop-pdo") {
+            if(!o.axes.empty()||o.all)throw std::runtime_error("start-pdo/stop-pdo 操作整个 PDO 服务，不接受 --axis/--all");
+        } else if((o.axes.empty()&&!o.all)||(!o.axes.empty()&&o.all))throw std::runtime_error("必须指定 --axis，且不能与 --all 混用");
+        if(o.all&&o.command!="disable")throw std::runtime_error("enable/jog-enabled/move-zero 请显式列出目标轴");
         if(o.command=="jog-enabled") {
             if(!o.displacement||o.deltas.empty()||!std::isfinite(o.rpm)||o.rpm<.05||o.rpm>2
                ||!std::any_of(o.deltas.begin(),o.deltas.end(),[](double value){return value!=0;}))
                 throw std::runtime_error("点动要求至少一个非零位移和 0.05..2 RPM 的转速");
             if(o.deltas.size()!=1&&o.deltas.size()!=o.axes.size())
                 throw std::runtime_error("位移数量 "+std::to_string(o.deltas.size())+" 与目标轴数量 "+std::to_string(o.axes.size())+" 不一致；指定 1 个值表示所有轴相同，或为每个轴依次指定 1 个值");
-        } else if(o.displacement||speed)throw std::runtime_error("使能/失能命令不接受运动参数");
+        } else if(o.command=="move-zero") {
+            if(o.displacement)throw std::runtime_error("move-zero 不接受位移参数，目标固定为编码器绝对位置 0");
+            if(!std::isfinite(o.rpm)||o.rpm<.05||o.rpm>2)
+                throw std::runtime_error("转速范围 0.05..2 RPM");
+        } else if(o.displacement||speed)throw std::runtime_error("此命令不接受运动参数");
         for(const auto& axis:o.axes) {
             std::size_t n=(axis[0]=='D'||axis[0]=='d'||axis[0]=='S'||axis[0]=='s')?1:0;
             if(n==axis.size())throw std::runtime_error("无效目标轴: "+axis);
@@ -306,13 +409,13 @@ bool parse_control_options(const std::vector<std::string>& args,ControlOptions& 
 }
 bool handle_control_cli(int argc,char** argv,int& exit_code) {
     std::vector<std::string> args(argv+1,argv+argc);bool relevant=false;
-    for(const auto& a:args){if(a=="--help"||a=="-h")return false;relevant|=a=="enable"||a=="disable"||a=="jog-enabled";}
+    for(const auto& a:args){if(a=="--help"||a=="-h")return false;relevant|=a=="enable"||a=="disable"||a=="jog-enabled"||a=="move-zero"||a=="start-pdo"||a=="stop-pdo";}
     if(!relevant)return false;
     ControlOptions options;std::string response;
     if(!parse_control_options(args,options,response)){std::cerr<<"[错误] "<<response<<'\n';exit_code=1;return true;}
     client_stop=0;std::signal(SIGINT,stop_client);std::signal(SIGTERM,stop_client);
     int result=control_request(options.iface,encode(options),response);
-    if(result==0&&options.command=="enable") {
+    if(result==0&&options.command=="start-pdo") {
         {
             InterfaceLock lock;
             if(!launch(options,lock,response)){std::cerr<<"[错误] "<<response<<'\n';exit_code=1;return true;}
@@ -328,6 +431,15 @@ bool handle_control_cli(int argc,char** argv,int& exit_code) {
         if(ok)for(int i:ids){std::string detail;const bool disabled=engine.disable_axis(i+1,detail);ok=disabled&&ok;combined+=slave_to_axis_name(i+1,engine.slave_count())+": "+detail+"\n";}
         if(!combined.empty())response=combined;
         result=ok?1:-1;
+    }
+    if(result==0&&options.command=="start-pdo") {
+        response="PDO 服务在启动后退出，请检查后台日志: "+directory()+"/"+options.iface+".log";result=-1;
+    }
+    if(result==0&&options.command=="stop-pdo") {
+        std::cout<<"[成功] [PDO 通信未运行] 无需停止\n";exit_code=0;return true;
+    }
+    if(result==0&&options.command=="enable") {
+        response="PDO 通信未运行，请先执行 start-pdo -i "+options.iface+"；未下发使能";result=-1;
     }
     if(result==0) {
         response.clear();for(const auto& axis:options.axes){if(!response.empty())response+="；";response+=axis+" 未使能（无运行中的 PDO 使能服务）";}

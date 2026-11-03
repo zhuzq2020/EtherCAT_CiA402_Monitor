@@ -142,5 +142,50 @@ int main(){try{
         check(!c.jog({0,1},true,std::vector<double>{1,-.5},.3,ticket,error),"per-axis list retains all-enabled precondition");
         check(error.find("D19 未使能")!=std::string::npos&&c.outputs()[0].target==100,"disabled member named and enabled member stays put");
     }
+    {
+        MotionControl c(axes());auto f=feedback();c.update(f,true);make_enabled(c,f,{0,2});
+        check(!c.move_zero({0,1},.3,ticket,error),"zero move rejects disabled member atomically");
+        check(c.outputs()[0].target==100,"rejected zero move holds enabled member");
+        check(c.move_zero({2,0},.3,ticket,error),"positive and negative positions return to zero");
+        MotionTicket rejected;
+        check(!c.move_zero({0},.3,rejected,error),"overlapping zero move rejected");
+        int n=0;
+        for(;n<60000&&c.result(ticket,error)==0;++n) {
+            c.update(f,true);
+            check(c.outputs()[0].target>=0&&c.outputs()[0].target<=100,"positive trajectory stays bounded");
+            check(c.outputs()[2].target<=0&&c.outputs()[2].target>=-100,"negative trajectory stays bounded");
+        }
+        check(c.result(ticket,error)==1&&n==500,"zero move uses synchronized smooth trajectory");
+        check(error.find("移动到零点完成")!=std::string::npos,"zero move has distinct completion message");
+        check(c.outputs()[0].target==0&&c.outputs()[2].target==0&&c.outputs()[1].target==200,"absolute zero endpoints and unselected axis unchanged");
+        check(c.outputs()[0].control==15&&c.outputs()[2].control==15,"zero move retains enable");
+        // Feedback is still at the original positions: plan from the held command.
+        check(c.move_zero({0,2},.3,ticket,error),"already at zero is accepted");
+        for(int j=0;j<500;++j){c.update(f,true);check(c.outputs()[0].target==0&&c.outputs()[2].target==0,"already-zero axes hold");}
+        check(c.result(ticket,error)==1,"already-zero request completes");
+        check(!c.move_zero({0},0,ticket,error),"invalid zero move speed rejected");
+        check(c.jog({0},false,500,.3,ticket,error),"jog after return to zero");
+        for(int j=0;j<60000&&c.result(ticket,error)==0;++j)c.update(f,true);
+        check(c.move_zero({0},.3,ticket,error),"return after jog uses new commanded position");
+        for(int j=0;j<60000&&c.result(ticket,error)==0;++j)c.update(f,true);
+        check(c.outputs()[0].target==0,"return after jog reaches absolute zero");
+    }
+    {
+        // Negating INT32_MIN needs a 64-bit displacement even though both endpoints fit.
+        MotionControl c({{"S1","",100000000}});
+        std::vector<MotionFeedback> f{{true,0x40,std::numeric_limits<std::int32_t>::min(),8}};
+        c.update(f,true);make_enabled(c,f,{0});
+        check(c.move_zero({0},2,ticket,error),"minimum encoder position can return to zero");
+        for(int j=0;j<60000&&c.result(ticket,error)==0;++j)c.update(f,true);
+        check(c.result(ticket,error)==1&&c.outputs()[0].target==0,"wide displacement reaches zero without overflow");
+    }
+    {
+        MotionControl c(axes());auto f=feedback();f[0].position=100000000;c.update(f,true);make_enabled(c,f,{0,1});
+        check(!c.move_zero({1,0},.05,ticket,error),"overlong zero move rejects entire group");
+        check(c.outputs()[0].target==100000000&&c.outputs()[1].target==200,"overlong return leaves all outputs unchanged");
+        check(c.move_zero({1},.3,ticket,error),"start zero move before communication failure");
+        c.update(f,false);
+        check(c.result(ticket,error)==-1&&c.outputs()[1].control==6,"zero move stops and disables on communication failure");
+    }
     std::cout<<"Multi-axis enable/jog atomicity, per-axis displacement, named errors, cancellation and PDO-failure checks passed\n";
 }catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}

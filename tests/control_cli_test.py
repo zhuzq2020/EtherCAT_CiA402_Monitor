@@ -41,6 +41,15 @@ def exchange(args, response, expected):
         server.close(); path.unlink(missing_ok=True)
 
 try:
+    result = run(['enable', '--axis', 'S2,S3'])
+    assert result.returncode == 1 and 'start-pdo' in result.stdout and '未下发使能' in result.stdout
+    assert '[INFO]' not in result.stdout
+    result = run(['stop-pdo'])
+    assert result.returncode == 0 and '无需停止' in result.stdout
+    result = exchange(['start-pdo'], 'OK\n[PDO 通信已建立] 可控制伺服=14\n', 'start-pdo')
+    assert result.returncode == 0 and 'PDO 通信已建立' in result.stdout
+    result = exchange(['stop-pdo'], 'OK\n[失能成功]；[PDO 通信已停止] 网口已释放\n', 'stop-pdo')
+    assert result.returncode == 0 and 'PDO 通信已停止' in result.stdout
     result = run(['jog-enabled', '--axis', 'D18,D19', '--delta_deg', '1'])
     assert result.returncode == 1
     assert 'D18 未使能' in result.stdout and 'D19 未使能' in result.stdout
@@ -63,6 +72,16 @@ try:
     result = exchange(['jog-enabled', '--axis', 'D18,D19', '--delta_deg', '0,-0.5'],
                       'OK\nD18；D19 [点动完成]\n', '--delta_deg 0,-0.5')
     assert result.returncode == 0
+    result = run(['move-zero', '--axis', 'D18,D19'])
+    assert result.returncode == 1 and 'D18 未使能' in result.stdout and 'D19 未使能' in result.stdout
+    assert '[INFO]' not in result.stdout
+    result = exchange(['move-zero', '--axis', 'D18,D19', '--speed_rpm', '.3'],
+                      'OK\nD18；D19 [移动到零点完成]\n',
+                      'move-zero --axis D18 --axis D19 --speed_rpm 0.29999999999999999')
+    assert result.returncode == 0 and '移动到零点完成' in result.stdout
+    result = exchange(['move-zero', '--axis', 'D18'],
+                      'OK\nD18 [移动到零点完成]\n', 'move-zero --axis D18 --speed_rpm 0.5')
+    assert result.returncode == 0
     result = exchange(['disable', '--all'], 'OK\nD18；D19 [失能成功]\n', 'disable --all')
     assert result.returncode == 0
     result = exchange(['status'], 'OK\nD18 OperationEnabled position=100\n', 'status')
@@ -74,6 +93,22 @@ try:
                       'OK\nD18 OperationEnabled\n', 'status')
     assert result.returncode == 1 and 'disable --all' in result.stderr
     for args in [
+        ['start-pdo', '--axis', 'S2'],
+        ['start-pdo', '--all'],
+        ['start-pdo', '--speed_rpm', '0.5'],
+        ['start-pdo', '--delta_deg', '1'],
+        ['stop-pdo', '--axis', 'S2'],
+        ['stop-pdo', '--all'],
+        ['stop-pdo', '--speed_rpm', '0.5'],
+        ['startpdo'],
+        ['stoppdo'],
+        ['move-zero'],
+        ['move-zero', '--all'],
+        ['move-zero', '--axis', 'D18', '--delta_deg', '1'],
+        ['move-zero', '--axis', 'D18', '--delta_count', '0'],
+        ['move-zero', '--axis', 'D18', '--speed_rpm', 'nan'],
+        ['move-zero', '--axis', 'D18', '--speed_rpm', '0.01'],
+        ['move-zero', '--axis', 'D18', '--speed_rpm', '3'],
         ['enable', '--axis', 'D18oops'],
         ['enable', '--axis', '0'],
         ['enable', '--axis', 'D18,'],

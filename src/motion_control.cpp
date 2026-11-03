@@ -57,6 +57,15 @@ bool MotionControl::jog(const std::vector<int>& ids, bool degrees, double delta,
 bool MotionControl::jog(const std::vector<int>& ids, bool degrees,
                          const std::vector<double>& values, double rpm,
                          MotionTicket& ticket, std::string& error) {
+    return plan_motion(ids,degrees,values,rpm,false,ticket,error);
+}
+bool MotionControl::move_zero(const std::vector<int>& ids, double rpm,
+                              MotionTicket& ticket, std::string& error) {
+    return plan_motion(ids,false,{0},rpm,true,ticket,error);
+}
+bool MotionControl::plan_motion(const std::vector<int>& ids, bool degrees,
+                                const std::vector<double>& values, double rpm, bool to_zero,
+                                MotionTicket& ticket, std::string& error) {
     if (!check_axes(ids,error)) return false;
     if (values.size()!=1 && values.size()!=ids.size()) {
         error="位移数量必须为 1（所有轴相同）或与目标轴数量一致"; return false;
@@ -69,27 +78,31 @@ bool MotionControl::jog(const std::vector<int>& ids, bool degrees,
         else if (f.mode != 8) append(error, info_[i].name + " 不在 CSP 模式，拒绝运动");
         else if (a.moving) append(error, info_[i].name + " 正在运动");
     }
-    if (!error.empty()) { error += "；整条点动命令已拒绝，所有目标轴均未开始本次运动"; return false; }
+    if (!error.empty()) {
+        error += to_zero ? "；整条移动到零点命令已拒绝，所有目标轴均未开始本次运动"
+                         : "；整条点动命令已拒绝，所有目标轴均未开始本次运动";
+        return false;
+    }
     bool any_displacement=false;
     for (double value:values) {
         if (!std::isfinite(value)) { error="位移必须为有限数值"; return false; }
         any_displacement |= value!=0;
     }
-    if (!any_displacement || !std::isfinite(rpm) || rpm < .05 || rpm > 2) {
-        error = "至少一个轴的位移必须非零，转速范围 0.05..2 RPM"; return false;
+    if ((!to_zero && !any_displacement) || !std::isfinite(rpm) || rpm < .05 || rpm > 2) {
+        error = to_zero ? "转速范围 0.05..2 RPM" : "至少一个轴的位移必须非零，转速范围 0.05..2 RPM"; return false;
     }
-    std::vector<std::int32_t> deltas; unsigned cycles = 500;
+    std::vector<std::int64_t> deltas; unsigned cycles = 500;
     for (std::size_t axis=0;axis<ids.size();++axis) {
         const int i=ids[axis];
         const double delta=values.size()==1?values.front():values[axis];
         const double ratio = info_[i].counts_per_deg;
-        const double counts = degrees ? delta * ratio : delta;
+        const double counts = to_zero ? -double(axes_[i].command) : (degrees ? delta * ratio : delta);
         if (!std::isfinite(ratio) || ratio <= 0 || !std::isfinite(counts)
-            || counts < std::numeric_limits<std::int32_t>::min()
-            || counts > std::numeric_limits<std::int32_t>::max()) {
+            || (!to_zero && (counts < std::numeric_limits<std::int32_t>::min()
+            || counts > std::numeric_limits<std::int32_t>::max()))) {
             append(error,info_[i].name + " 换算后位移超限"); continue;
         }
-        const auto n = static_cast<std::int32_t>(std::llround(counts));
+        const auto n = std::llround(counts);
         const auto end = std::int64_t(axes_[i].command) + n;
         const double seconds = std::max(1.0, 1.875 * std::abs(double(n)) / (ratio*360) / rpm * 60);
         if ((!n && delta!=0) || end < std::numeric_limits<std::int32_t>::min() || end > std::numeric_limits<std::int32_t>::max()
@@ -102,7 +115,7 @@ bool MotionControl::jog(const std::vector<int>& ids, bool degrees,
         auto& a = axes_[ids[n]]; ++a.generation; a.group = group; a.start = a.command;
         a.delta = deltas[n]; a.elapsed = 0; a.duration = cycles; a.moving = true; a.error.clear();
     }
-    ticket_for(ids,"jog-enabled",ticket); return true;
+    ticket_for(ids,to_zero?"move-zero":"jog-enabled",ticket); return true;
 }
 bool MotionControl::disable(const std::vector<int>& ids, MotionTicket& ticket, std::string& error) {
     // Disabling remains available with stale feedback; completion still needs
@@ -179,7 +192,8 @@ int MotionControl::result(const MotionTicket& ticket, std::string& detail) const
     if (!done) return 0;
     for (int i : ticket.axes) append(detail, info_[i].name);
     detail += ticket.verb == "enable" ? " [使能成功] 后台持续保持当前位置"
-            : ticket.verb == "disable" ? " [失能成功]" : " [点动完成] 保持终点并继续使能";
+            : ticket.verb == "disable" ? " [失能成功]" : ticket.verb == "move-zero" ? " [移动到零点完成] 保持零点并继续使能"
+            : " [点动完成] 保持终点并继续使能";
     return 1;
 }
 std::vector<MotionOutput> MotionControl::outputs() const {

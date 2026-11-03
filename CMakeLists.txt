@@ -45,6 +45,7 @@ add_executable(arm_maint
     src/eeprom_access.cpp
     src/motion_control.cpp
     src/persistent_bus.cpp
+    src/pdo_exchange.cpp
     src/control_service.cpp
 )
 
@@ -66,11 +67,30 @@ install(TARGETS arm_maint DESTINATION bin)
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(pdo_exchange_test tests/pdo_exchange_test.cpp src/pdo_exchange.cpp)
+    target_include_directories(pdo_exchange_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    target_link_libraries(pdo_exchange_test PRIVATE soem_static pthread)
+    target_link_options(pdo_exchange_test PRIVATE
+        -Wl,--wrap=ecx_getindex -Wl,--wrap=ecx_setbufstat
+        -Wl,--wrap=ecx_outframe_red -Wl,--wrap=ecx_waitinframe)
+    add_test(NAME pdo_exchange COMMAND pdo_exchange_test)
+    add_executable(motion_pdo_group_test tests/motion_pdo_group_test.cpp)
+    target_include_directories(motion_pdo_group_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    target_link_libraries(motion_pdo_group_test PRIVATE soem_static)
+    add_test(NAME motion_pdo_group COMMAND motion_pdo_group_test)
+    add_executable(csp_mode_test tests/csp_mode_test.cpp src/motion_control.cpp)
+    target_include_directories(csp_mode_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    add_test(NAME csp_mode COMMAND csp_mode_test)
     add_executable(motion_control_test tests/motion_control_test.cpp src/motion_control.cpp)
     target_include_directories(motion_control_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
     add_test(NAME motion_control COMMAND motion_control_test)
     find_package(Python3 QUIET COMPONENTS Interpreter)
     if(Python3_Interpreter_FOUND)
+        add_executable(control_lifecycle_mock tests/control_lifecycle_mock.cpp src/control_service.cpp src/motion_control.cpp)
+        target_include_directories(control_lifecycle_mock PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+        target_link_libraries(control_lifecycle_mock PRIVATE soem_static pthread)
+        add_test(NAME control_lifecycle COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/control_lifecycle_test.py" "$<TARGET_FILE:control_lifecycle_mock>")
         add_test(NAME control_cli COMMAND "${Python3_EXECUTABLE}"
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/control_cli_test.py" "$<TARGET_FILE:arm_maint>")
         add_test(NAME alias_cli COMMAND "${Python3_EXECUTABLE}"

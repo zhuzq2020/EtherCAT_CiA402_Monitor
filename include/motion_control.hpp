@@ -24,6 +24,7 @@ public:
     // One displacement broadcasts; otherwise values follow the axes' order.
     bool jog(const std::vector<int>& axes, bool degrees, const std::vector<double>& deltas,
              double rpm, MotionTicket& ticket, std::string& error);
+    bool move_zero(const std::vector<int>& axes, double rpm, MotionTicket& ticket, std::string& error);
     bool disable(const std::vector<int>& axes, MotionTicket& ticket, std::string& error);
     // 0=pending, 1=complete, -1=failed. No state transitions occur here.
     int result(const MotionTicket& ticket, std::string& detail) const;
@@ -38,12 +39,15 @@ private:
     struct Axis {
         Phase phase{Phase::Disabled};
         std::uint64_t generation{0}, group{0};
-        std::int32_t command{0}, start{0}, delta{0};
+        std::int32_t command{0}, start{0};
+        std::int64_t delta{0};
         unsigned elapsed{0}, duration{0}, transition{0};
         std::uint16_t control{6};
         bool moving{false};
         std::string error;
     };
+    bool plan_motion(const std::vector<int>& axes, bool degrees, const std::vector<double>& deltas,
+                     double rpm, bool to_zero, MotionTicket& ticket, std::string& error);
     bool check_axes(const std::vector<int>& axes, std::string& error) const;
     void ticket_for(const std::vector<int>& axes, const std::string& verb, MotionTicket& ticket);
     std::vector<MotionAxisInfo> info_;
