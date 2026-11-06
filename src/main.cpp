@@ -136,6 +136,8 @@ void show_help() {
               << "       -i eno0；先执行本命令，再执行 enable\n"
               << "  15. stop-pdo         停止运动、失能全部受控轴，关闭 PDO 服务并释放网口\n"
               << "       -i eno0；未运行时直接返回\n\n"
+              << "  16. zero-torque      同川扭矩传感器清零 (Pr8.01 / 0x3801:00 = 10)\n"
+              << "       --axis <Dxx|1..N> 或 --all；必须 --confirm，先失能并确保处于所需零扭矩条件\n\n"
               << "示例:\n"
               << "  sudo ./arm_maint status\n"
               << "  sudo ./arm_maint clear-fault --axis D18\n"
@@ -246,7 +248,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    if (command != "configure-pdo" && command != "status" && command != "clear-fault" && command != "set-zero" && command != "read-pos" && command != "read-sdo" && command != "jog" && command != "write-alias" && command != "read-alias" && command != "backup-sii" && command != "enable" && command != "disable") {
+    if (command != "configure-pdo" && command != "status" && command != "clear-fault" && command != "set-zero" && command != "zero-torque" && command != "read-pos" && command != "read-sdo" && command != "jog" && command != "write-alias" && command != "read-alias" && command != "backup-sii" && command != "enable" && command != "disable") {
         std::cerr << "[错误] 未知命令: " << command << "，输入 --help 查看支持命令。\n";
         return 1;
     }
@@ -270,6 +272,17 @@ int main(int argc, char** argv) {
         }
         if (!all_axes && target_axis.empty()) {
             std::cerr << "[错误] 请指定标零目标: --axis <D18..D24> 或 --all\n";
+            return 1;
+        }
+    }
+
+    if (command == "zero-torque") {
+        if (!confirmed) {
+            std::cerr << "[安全拦截] 请确认传感器处于所需零扭矩条件，并追加 --confirm。\n";
+            return 1;
+        }
+        if ((!all_axes && target_axis.empty()) || (all_axes && !target_axis.empty())) {
+            std::cerr << "[错误] zero-torque 必须且只能指定 --axis <Dxx|1..N> 或 --all。\n";
             return 1;
         }
     }
@@ -496,6 +509,21 @@ int main(int argc, char** argv) {
                 std::string detail;
                 const bool ok = engine.set_zero(i, detail);
                 std::cout << "  - [" << name << "] 从站 " << i << ": " << (ok ? "[标定成功] " : "[标定失败] ") << detail << "\n";
+                if (!ok) all_success = false;
+            }
+        }
+        return all_success ? 0 : 1;
+    }
+
+    if (command == "zero-torque") {
+        std::cout << "[INFO] 正在发送同川扭矩传感器清零命令...\n";
+        bool all_success = true;
+        for (int i = 1; i <= total_slaves; ++i) {
+            if (all_axes || i == target_slave) {
+                std::string detail;
+                const bool ok = engine.zero_torque(i, detail);
+                std::cout << "  - [" << robot_maint::slave_to_axis_name(i, total_slaves)
+                          << "] 从站 " << i << ": " << (ok ? "[写入成功] " : "[失败] ") << detail << "\n";
                 if (!ok) all_success = false;
             }
         }

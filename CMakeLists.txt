@@ -93,6 +93,8 @@ if(BUILD_TESTING)
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/control_lifecycle_test.py" "$<TARGET_FILE:control_lifecycle_mock>")
         add_test(NAME control_cli COMMAND "${Python3_EXECUTABLE}"
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/control_cli_test.py" "$<TARGET_FILE:arm_maint>")
+        add_test(NAME zero_torque_cli COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/zero_torque_cli_test.py" "$<TARGET_FILE:arm_maint>")
         add_test(NAME alias_cli COMMAND "${Python3_EXECUTABLE}"
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/alias_cli_test.py" "$<TARGET_FILE:arm_maint>")
     endif()

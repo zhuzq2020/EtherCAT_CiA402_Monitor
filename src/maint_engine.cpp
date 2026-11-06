@@ -761,6 +761,42 @@ bool MaintEngine::set_zero(int slave_index, std::string& detail) {
     return true;
 }
 
+bool MaintEngine::zero_torque(int slave_index, std::string& detail) {
+    if (!initialized_ || slave_index <= 0 || slave_index > slave_count_) {
+        detail = "从站索引超出范围";
+        return false;
+    }
+
+    uint32_t vendor_id = context_.slavelist[slave_index].eep_man;
+    if (vendor_id == 0 && !read_sdo(slave_index, 0x1018, 1, vendor_id)) {
+        detail = "读取厂商 ID 失败，未执行扭矩传感器清零";
+        return false;
+    }
+    if (vendor_id != kTongchuanVendorId) {
+        detail = "扭矩传感器清零仅支持同川驱动，未写入 (厂商: " + vendor_id_to_name(vendor_id) + ")";
+        return false;
+    }
+
+    uint16_t status_word = 0;
+    if (!read_sdo(slave_index, SDO_STATUS_WORD, 0, status_word)) {
+        detail = "读取状态字失败，无法确认轴已失能，未执行清零";
+        return false;
+    }
+    if ((status_word & 0x0004U) != 0) {
+        detail = "安全拦截：该轴仍使能，请先失能再执行扭矩传感器清零";
+        return false;
+    }
+
+    const uint16_t command = 10U;
+    if (!write_sdo(slave_index, SDO_TONGCHUAN_ZERO_TORQUE, 0, command)) {
+        detail = "扭矩传感器清零失败：向 0x3801:00 写入 uint16 值 10 失败";
+        return false;
+    }
+    // 厂商未提供完成状态定义，不将命令对象回读值作为传感器归零证明。
+    detail = "扭矩传感器清零命令已应答 (0x3801:00 = 10)；请读取扭矩反馈确认清零效果";
+    return true;
+}
+
 bool MaintEngine::get_axis_ratio(int slave_index, double& counts_per_deg) {
     uint32_t vendor_id = context_.slavelist[slave_index].eep_man;
     if (vendor_id == 0) {

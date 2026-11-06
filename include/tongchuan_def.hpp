@@ -29,6 +29,8 @@ constexpr std::uint16_t SDO_GEAR_RATIO_COE         = 0x6091U; // 标准电子齿
 
 // 同川专用标定参数: Pr8.01 (写入 5 表示将当前物理位置标定为多圈绝对零点)
 constexpr std::uint16_t SDO_TONGCHUAN_SET_ZERO     = 0x3801U;
+// Pr8.01 复用命令对象：写入 10 表示扭矩传感器清零。
+constexpr std::uint16_t SDO_TONGCHUAN_ZERO_TORQUE  = 0x3801U;
 
 // 意优专用参数: 0x2130 (写入 1 表示保存标定参数到 EEPROM/Flash)
 constexpr std::uint16_t SDO_EYOU_SAVE_FLASH        = 0x2130U;

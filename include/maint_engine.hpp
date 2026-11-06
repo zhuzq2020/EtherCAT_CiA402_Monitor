@@ -54,6 +54,9 @@ public:
     // 单轴标零 (发送 0x3801 = 5，延时并回读校验)
     bool set_zero(int slave_index, std::string& detail);
 
+    // 同川扭矩传感器清零 (uint16 写入 0x3801:00 = 10，仅允许失能轴)
+    bool zero_torque(int slave_index, std::string& detail);
+
     // 快速读取单轴实际位置
     bool read_position(int slave_index, std::int32_t& pos);
 
