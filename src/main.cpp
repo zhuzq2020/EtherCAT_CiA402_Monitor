@@ -1,66 +1,66 @@
-#include "maint_engine.hpp"
-#include "control_service.hpp"
-#include "tongchuan_def.hpp"
+#include "arm_controller.hpp"
+#include "cia402_defs.hpp"
+#include "rpc_session.hpp"
 
-#include <iostream>
-#include <iomanip>
-#include <string>
-#include <vector>
 #include <csignal>
 #include <cstdint>
 #include <cstring>
+#include <iomanip>
+#include <iostream>
 #include <sstream>
-#include <set>
-#include <filesystem>
+#include <string>
+#include <vector>
 
 namespace {
 
 void sigint_handler(int) {
-    robot_maint::MaintEngine::request_stop();
+    robot_maint::ArmController::request_stop();
 }
 
-bool parse_object_address(const std::string& text, unsigned max, unsigned& result) {
+bool parse_unsigned(const std::string& text, unsigned max, unsigned& result) {
     if (text.empty() || text[0] == '-' || text[0] == '+') return false;
     try {
         std::size_t end = 0;
-        const int base = text.size() > 2 && text[0] == '0' &&
-                         (text[1] == 'x' || text[1] == 'X') ? 16 : 10;
+        const int base = (text.size() > 2 && text[0] == '0' &&
+                          (text[1] == 'x' || text[1] == 'X')) ? 16 : 10;
         const auto parsed = std::stoul(text, &end, base);
         if (end != text.size() || parsed > max) return false;
         result = static_cast<unsigned>(parsed);
         return true;
-    } catch (const std::exception&) {
+    } catch (...) {
         return false;
     }
 }
 
-// 严格解析物理从站列表，拒绝重复、倒序范围和空项。
-bool parse_slave_list(const std::string& text, std::vector<int>& result) {
-    if (text.empty() || text.back() == ',') return false;
-    std::set<unsigned> seen;
-    std::istringstream input(text);
-    std::string token;
-    while (std::getline(input, token, ',')) {
-        const auto dash = token.find('-');
-        unsigned first = 0, last = 0;
-        if (!parse_object_address(token.substr(0, dash), 65535, first) || first == 0) return false;
-        last = first;
-        if (dash != std::string::npos &&
-            (!parse_object_address(token.substr(dash+1), 65535, last) || last < first)) return false;
-        for (unsigned n = first; n <= last; ++n) {
-            if (!seen.insert(n).second) return false;
-            result.push_back(static_cast<int>(n));
-        }
+bool parse_double(const std::string& text, double& out) {
+    if (text.empty()) return false;
+    try {
+        std::size_t end = 0;
+        out = std::stod(text, &end);
+        return end == text.size();
+    } catch (...) {
+        return false;
     }
-    return !result.empty();
+}
+
+bool parse_positive_int(const std::string& text, int& out) {
+    if (text.empty() || text[0] == '-') return false;
+    try {
+        std::size_t end = 0;
+        const long val = std::stol(text, &end, 10);
+        if (end != text.size() || val <= 0 || val > 3600000L) return false;
+        out = static_cast<int>(val);
+        return true;
+    } catch (...) {
+        return false;
+    }
 }
 
 std::string format_sdo_value(const std::vector<std::uint8_t>& bytes) {
     std::ostringstream out;
     out << "长度 " << bytes.size() << " 字节, 原始字节 (低位在前):";
     for (const auto byte : bytes) {
-        out << ' ' << std::hex << std::setw(2) << std::setfill('0')
-            << static_cast<unsigned>(byte);
+        out << ' ' << std::hex << std::setw(2) << std::setfill('0') << static_cast<unsigned>(byte);
     }
     if (bytes.size() == 1 || bytes.size() == 2 || bytes.size() == 4 || bytes.size() == 8) {
         std::uint64_t number = 0;
@@ -73,195 +73,189 @@ std::string format_sdo_value(const std::vector<std::uint8_t>& bytes) {
         }
         std::int64_t signed_number = 0;
         std::memcpy(&signed_number, &number, sizeof(number));
-        const std::uint64_t unsigned_number = bits == 64
-            ? number : number & ((std::uint64_t{1} << bits) - 1);
+        const std::uint64_t unsigned_number = (bits == 64)
+            ? number : (number & ((std::uint64_t{1} << bits) - 1));
         out << std::dec << ", 无符号: " << unsigned_number << ", 有符号: " << signed_number;
     }
     return out.str();
 }
 
-void show_help() {
-    std::cout << "\n======================================================================\n"
-              << " 机器人现场维护与标定工具 (arm_maint) - 纯用户态 SOEM 架构\n"
-              << " 支持同川 (Tongchuan)、意优 (Eyou) 及 CiA-402 标准伺服电机\n"
-              << "======================================================================\n\n"
+bool encode_sdo_scalar(const std::string& type_name, const std::string& val_str,
+                       std::vector<std::uint8_t>& out, std::string& error) {
+    out.clear();
+    try {
+        std::size_t used = 0;
+        const int base = (val_str.size() > 2 && val_str[0] == '0' &&
+                          (val_str[1] == 'x' || val_str[1] == 'X')) ? 16 : 10;
+        if (type_name == "u8" || type_name == "u16" || type_name == "u32") {
+            const unsigned long v = std::stoul(val_str, &used, base);
+            if (used != val_str.size()) { error = "无效无符号整数: " + val_str; return false; }
+            const std::size_t bytes = (type_name == "u8") ? 1 : (type_name == "u16" ? 2 : 4);
+            const unsigned long max_v = (bytes == 1) ? 0xFFUL : (bytes == 2 ? 0xFFFFUL : 0xFFFFFFFFUL);
+            if (v > max_v) { error = "数值超出 " + type_name + " 范围"; return false; }
+            for (std::size_t i = 0; i < bytes; ++i) out.push_back(static_cast<std::uint8_t>((v >> (8 * i)) & 0xFFU));
+            return true;
+        }
+        if (type_name == "i8" || type_name == "i16" || type_name == "i32") {
+            const long v = std::stol(val_str, &used, base);
+            if (used != val_str.size()) { error = "无效有符号整数: " + val_str; return false; }
+            const std::size_t bytes = (type_name == "i8") ? 1 : (type_name == "i16" ? 2 : 4);
+            const long min_v = (bytes == 1) ? -128L : (bytes == 2 ? -32768L : -2147483648L);
+            const long max_v = (bytes == 1) ? 127L : (bytes == 2 ? 32767L : 2147483647L);
+            if (v < min_v || v > max_v) { error = "数值超出 " + type_name + " 范围"; return false; }
+            const std::uint32_t raw = static_cast<std::uint32_t>(static_cast<std::int32_t>(v));
+            for (std::size_t i = 0; i < bytes; ++i) out.push_back(static_cast<std::uint8_t>((raw >> (8 * i)) & 0xFFU));
+            return true;
+        }
+        error = "不支持的数据类型: " + type_name + " (可选: u8, i8, u16, i16, u32, i32)";
+        return false;
+    } catch (...) {
+        error = "解析数值失败: " + val_str;
+        return false;
+    }
+}
+
+void show_help(const char* prog) {
+    std::cout << "\n================================================================================\n"
+              << " 通用机械臂 EtherCAT 控制与维护 SDK 工具 (arm_maint)\n"
+              << " 支持 法奥 (Fairino) / 同川 (Tongchuan) / 意优 (Eyou) / 标准 CiA-402 伺服\n"
+              << "================================================================================\n\n"
               << "用法:\n"
-              << "  arm_maint [全局选项] <命令> [参数]\n\n"
+              << "  " << prog << " [-i <iface>] <命令> [参数...]\n\n"
               << "全局选项:\n"
-              << "  -i, --iface <NAME>    指定以太网接口名称 (默认: enp2s0)\n"
+              << "  -i, --iface <NAME>    指定以太网接口名称 (默认: eno0)\n"
               << "  -h, --help            显示本帮助信息\n\n"
-              << "命令列表:\n"
-              << "  1. status             扫描总线，以表格查看从站拓扑、电机厂商、CiA402状态、故障码及位置\n"
-              << "  2. clear-fault        清除伺服驱动器故障报警 (标准 CiA-402 复位)\n"
-              << "       --axis <Dxx|1..N>  清除指定单轴故障 (如 D18、1、S1)\n"
-              << "       --all              清除总线所有轴故障\n"
-              << "  3. jog                [受控 PDO 点动] 安全慢速微调转动指定关节以对齐零位刻线\n"
-              << "       --axis <Dxx|1..N>  指定点动目标轴 (必填，单轴操作以保安全)\n"
-              << "       --delta_deg <DEG>  微调转动角度 (度，如 1.0 或 -0.5，自动换算减速比)\n"
-              << "       --delta_count <N>  微调脉冲数 (绝对计数，如 5000 或 -5000)\n"
-              << "       --speed_rpm <RPM>  输出端安全微调转速 (默认: 0.5 RPM，限幅 0.05~2.0)\n"
-              << "  4. set-zero           将机械臂当前物理姿态标定为编码器绝对零点 (自动适配同川/意优)\n"
-              << "       --axis <Dxx|1..N>  标定指定单轴 (更换单轴电机时使用)\n"
-              << "       --all              标定整机/整臂所有轴\n"
-              << "       --confirm          强制确认标志 (安全防护，防止误触覆盖原点)\n"
-              << "  5. read-pos           快速读取单轴或全臂当前编码器实际脉冲位置\n"
-              << "       --axis <Dxx|1..N>  读取指定轴\n"
-              << "       --all              读取全部轴\n"
-              << "  configure-pdo --slaves 2-8,10-16 [--confirm --backup-dir DIR] [--save]  批量对齐 PDO\n"
-              << "  configure-pdo --slave N [--confirm --backup FILE] [--save]  对齐同川 lagbotwbc PDO，默认只读比较\n"
-              << "  6. read-sdo           读取指定 CoE 对象，默认读取全部从站\n"
-              << "       --index <0xHHHH>   对象索引（必填，如 0x6064）\n"
-              << "       --subindex <0..255> 子索引（默认 0，也可用 0x 格式）\n"
-              << "       --axis <Dxx|1..N>  读取指定轴；--all 读取全部轴\n"
-              << "  7. write-alias        将 Hot Connect 组首 Alias 写入从站 SII EEPROM（支持同川/意优/其他型号）\n"
-              << "       --slave <1..N>     按本次扫描序号选择物理从站（不接受 Dxx，防止混淆）\n"
-              << "       --alias <1..65535> 要写入的 Alias（右臂组首 D18 为 18）\n"
-              << "       --backup <FILE>    保存完整写前备份及 <FILE>.after.bin 写后镜像（不得已存在）\n"
-              << "       --confirm WRITE-EEPROM-ALIAS  精确确认短语\n\n"
-              << "  8. enable             复用已启动的 PDO 服务使能，可多轴，持续保持当前位置\n"
-              << "       --axis D18,D19     或重复 --axis D18 --axis D19\n"
-              << "  9. disable            单轴/多轴失能；--all 失能并停止后台 PDO 服务\n"
-              << "       --axis <Dxx|1..N> 或 --all\n\n"
-              << "  10. read-alias        读取 ESC Alias、EEPROM Alias、配置 CRC 和错误状态\n"
-              << "       --slave <1..N>     必填；不写 EEPROM，不清除已有错误\n\n"
-              << "  11. backup-sii        只读备份完整 EEPROM 内容，不覆盖已有文件\n"
-              << "       --slave <1..N> --backup <FILE>\n\n"
-              << "  12. jog-enabled      独立命令：只对已使能轴点动，不自动使能\n"
-              << "       --axis D18,D19 --delta_deg 1.0 [--speed_rpm 0.3]\n"
-              << "       多轴不同角度: --axis D18,D19 --delta_deg 1.0,-0.5（按轴顺序对应）\n"
-              << "       或 --delta_count 5000,-2000；单值应用全部轴；完成后继续使能\n\n"
-              << "  13. move-zero        已使能轴平滑移动到编码器绝对位置 0，完成后继续使能\n"
-              << "       --axis D18,D19 [--speed_rpm 0.3]；不修改零点标定\n\n"
-              << "  14. start-pdo        扫描全部受支持伺服，建立后台 PDO 通信，保持失能\n"
-              << "       -i eno0；先执行本命令，再执行 enable\n"
-              << "  15. stop-pdo         停止运动、失能全部受控轴，关闭 PDO 服务并释放网口\n"
-              << "       -i eno0；未运行时直接返回\n\n"
-              << "  16. zero-torque      同川扭矩传感器清零 (Pr8.01 / 0x3801:00 = 10)\n"
-              << "       --axis <Dxx|1..N> 或 --all；必须 --confirm，先失能并确保处于所需零扭矩条件\n\n"
-              << "示例:\n"
-              << "  sudo ./arm_maint status\n"
-              << "  sudo ./arm_maint clear-fault --axis D18\n"
-              << "  # 微调 D18 关节转动 +1.0 度以对齐零位刻线:\n"
-              << "  sudo ./arm_maint jog --axis D18 --delta_deg 1.0\n"
-              << "  # 微调 D20 关节反向转动 -0.5 度:\n"
-              << "  sudo ./arm_maint jog --axis D20 --delta_deg -0.5 --speed_rpm 0.3\n"
-              << "  # 对齐刻线后执行绝对零点标定 (自动识别同川或意优驱动):\n"
-              << "  sudo ./arm_maint set-zero --axis D18 --confirm\n"
-              << "  sudo ./arm_maint read-sdo --axis D18 --index 0x6064\n"
-              << "  sudo ./arm_maint read-sdo --axis 1 --index 0x1018 --subindex 1\n"
-              << "  # 仅为右臂链头（扫描从站 1）写入 D18 Hot Connect Alias:\n"
-              << "  sudo ./arm_maint write-alias --slave 1 --alias 18 --backup ./d18-sii.bin --confirm WRITE-EEPROM-ALIAS\n\n";
+              << "通用底层命令:\n"
+              << "  status [--detail]     扫描总线拓扑、厂商、型号、CiA-402 状态、故障码与当前位置\n"
+              << "  read-sdo              读取 CoE 对象 (--index 0xHHHH [--subindex 0] [--axis A | --all])\n"
+              << "  write-sdo             写入 CoE 对象 (--axis A --index 0xHHHH --type u8|i8|u16|i16|u32|i32 --value V --confirm)\n"
+              << "  set-zero              标定当前位置为编码器绝对零点 (法奥/同川/意优，需 --axis A | --all --confirm)\n"
+              << "  jog                   单轴相对平滑点动并保持终点: jog <axis> <deg> [ms] 或 --axis A --deg D [--ms M] [--abs]\n"
+              << "  jog-abs               单轴绝对角度平滑点动并保持终点: jog-abs <axis> <abs_deg> [ms]\n"
+              << "  zero                  单轴平滑运动归零 0.000°: zero <axis> [ms]\n\n"
+              << "Python 流程脚本 (位于 scripts/):\n"
+              << "  scripts/pose_control.py   多姿态同步平滑轨迹控制 (法奥/同川/意优)\n"
+              << "  scripts/backup_sii.py     EEPROM 完整 SII 备份\n"
+              << "  scripts/read_alias.py     读取 ESC / EEPROM Alias 与 CRC\n"
+              << "  scripts/write_alias.py    安全写入 Station Alias 并校验全镜像\n"
+              << "  scripts/configure_pdo.py  同川 PDO 映射核验与写入\n\n";
 }
 
 } // namespace
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        show_help();
+        show_help(argv[0]);
         return 1;
     }
 
     std::signal(SIGINT, sigint_handler);
     std::signal(SIGTERM, sigint_handler);
-    int control_exit = 0;
-    if (robot_maint::handle_control_cli(argc, argv, control_exit)) return control_exit;
 
-    std::string iface = "enp2s0";
+    std::string iface = "eno0";
     std::string command;
+    std::vector<std::string> positional;
+
     std::string target_axis;
     bool all_axes = false;
     bool confirmed = false;
-    bool pdo_save = false;
-    std::string confirmation_phrase;
-    std::vector<int> pdo_slaves;
-    std::string pdo_backup_dir;
-    int alias_slave = -1;
-    int alias_value = -1;
-    std::string backup_path;
-    double delta_deg = 1.0;
-    bool has_delta_deg = false;
-    int32_t delta_count = 0;
-    bool has_delta_count = false;
-    double speed_rpm = 0.5;
+    bool detailed = false;
+    bool jog_abs_flag = false;
+
+    double jog_deg = 1.0;
+    bool has_jog_deg = false;
+    int jog_ms = -1;
+
     unsigned sdo_index = 0;
     unsigned sdo_subindex = 0;
     bool has_sdo_index = false;
+    std::string sdo_type;
+    std::string sdo_value;
 
     for (int i = 1; i < argc; ++i) {
-        std::string arg = argv[i];
+        const std::string arg = argv[i];
         if (arg == "-h" || arg == "--help") {
-            show_help();
+            show_help(argv[0]);
             return 0;
         } else if (arg == "-i" || arg == "--iface") {
-            if (++i < argc) iface = argv[i];
+            if (++i >= argc) { std::cerr << "[错误] 缺少网卡名称参数。\n"; return 1; }
+            iface = argv[i];
         } else if (arg == "--axis") {
-            if (++i < argc) target_axis = argv[i];
+            if (++i >= argc) { std::cerr << "[错误] --axis 缺少参数。\n"; return 1; }
+            target_axis = argv[i];
+        } else if (arg == "--all") {
+            all_axes = true;
+        } else if (arg == "--confirm") {
+            confirmed = true;
+        } else if (arg == "--detail" || arg == "-v") {
+            detailed = true;
+        } else if (arg == "--abs") {
+            jog_abs_flag = true;
+        } else if (arg == "--deg") {
+            if (++i >= argc || !parse_double(argv[i], jog_deg)) {
+                std::cerr << "[错误] --deg 必须是有效的数值。\n";
+                return 1;
+            }
+            has_jog_deg = true;
+        } else if (arg == "--ms") {
+            if (++i >= argc || !parse_positive_int(argv[i], jog_ms)) {
+                std::cerr << "[错误] --ms 必须是正整数。\n";
+                return 1;
+            }
         } else if (arg == "--index" || arg == "--subindex") {
-            const bool is_index = arg == "--index";
+            const bool is_index = (arg == "--index");
             unsigned parsed = 0;
-            if (++i >= argc || !parse_object_address(argv[i], is_index ? 0xffffU : 0xffU, parsed)) {
+            if (++i >= argc || !parse_unsigned(argv[i], is_index ? 0xFFFFU : 0xFFU, parsed)) {
                 std::cerr << "[错误] " << arg << " 必须是有效的十进制或 0x 十六进制数。\n";
                 return 1;
             }
             if (is_index) { sdo_index = parsed; has_sdo_index = true; }
             else sdo_subindex = parsed;
-        } else if (arg == "--save") {
-            pdo_save = true;
-        } else if (arg == "--all") {
-            all_axes = true;
-        } else if (arg == "--confirm") {
-            confirmed = true;
-            if (i + 1 < argc && std::string(argv[i + 1]) == "WRITE-EEPROM-ALIAS") {
-                confirmation_phrase = argv[++i];
-            }
-        } else if (arg == "--slaves") {
-            if (!pdo_slaves.empty() || ++i >= argc || !parse_slave_list(argv[i], pdo_slaves)) {
-                std::cerr << "--slaves requires a unique list/range, e.g. 2-8 or 2,3,5\n";
-                return 1;
-            }
-        } else if (arg == "--backup-dir") {
-            if (++i >= argc || std::string(argv[i]).empty() || !pdo_backup_dir.empty()) return 1;
-            pdo_backup_dir = argv[i];
-        } else if (arg == "--slave" || arg == "--alias") {
-            unsigned parsed = 0;
-            if (++i >= argc || !parse_object_address(argv[i], 0xffffU, parsed) || parsed == 0) {
-                std::cerr << "[错误] " << arg << " 必须是 1..65535 的整数。\n";
-                return 1;
-            }
-            if (arg == "--slave") alias_slave = static_cast<int>(parsed);
-            else alias_value = static_cast<int>(parsed);
-        } else if (arg == "--backup") {
-            if (++i < argc) backup_path = argv[i];
-        } else if (arg == "--delta_deg") {
-            if (++i < argc) { delta_deg = std::stod(argv[i]); has_delta_deg = true; }
-        } else if (arg == "--delta_count") {
-            if (++i < argc) { delta_count = std::stol(argv[i]); has_delta_count = true; }
-        } else if (arg == "--speed_rpm") {
-            if (++i < argc) { speed_rpm = std::stod(argv[i]); }
-        } else if (command.empty() && arg[0] != '-') {
+        } else if (arg == "--type") {
+            if (++i >= argc) return 1;
+            sdo_type = argv[i];
+        } else if (arg == "--value") {
+            if (++i >= argc) return 1;
+            sdo_value = argv[i];
+        } else if (command.empty() && !arg.empty() && arg[0] != '-') {
             command = arg;
+        } else {
+            positional.push_back(arg);
         }
     }
 
     if (command.empty()) {
-        std::cerr << "[错误] 未指定有效命令，请参考 --help。\n";
+        show_help(argv[0]);
         return 1;
     }
 
-    if (command != "configure-pdo" && command != "status" && command != "clear-fault" && command != "set-zero" && command != "zero-torque" && command != "read-pos" && command != "read-sdo" && command != "jog" && command != "write-alias" && command != "read-alias" && command != "backup-sii" && command != "enable" && command != "disable") {
-        std::cerr << "[错误] 未知命令: " << command << "，输入 --help 查看支持命令。\n";
-        return 1;
-    }
-
-    // 参数校验预检
-    if (command == "clear-fault" && !all_axes && target_axis.empty()) {
-        std::cerr << "[错误] 请指定待清错目标: --axis <D18..D24> 或 --all\n";
+    if (command != "status" && command != "read-sdo" && command != "write-sdo" &&
+        command != "set-zero" && command != "jog" && command != "jog-abs" &&
+        command != "zero" && command != "rpc") {
+        std::cerr << "[错误] 未知命令: " << command << "，请运行 --help 查看支持命令。\n";
         return 1;
     }
 
     if (command == "read-sdo" && !has_sdo_index) {
         std::cerr << "[错误] read-sdo 必须指定 --index，例如 --index 0x6064。\n";
         return 1;
+    }
+
+    std::vector<std::uint8_t> write_sdo_payload;
+    if (command == "write-sdo") {
+        if (!confirmed) {
+            std::cerr << "[安全拦截] write-sdo 会写入从站 SDO 对象，请追加 --confirm。\n";
+            return 1;
+        }
+        if (target_axis.empty() || !has_sdo_index || sdo_type.empty() || sdo_value.empty()) {
+            std::cerr << "[错误] write-sdo 必须指定 --axis, --index, --type, --value, --confirm。\n";
+            return 1;
+        }
+        std::string err;
+        if (!encode_sdo_scalar(sdo_type, sdo_value, write_sdo_payload, err)) {
+            std::cerr << "[错误] " << err << '\n';
+            return 1;
+        }
     }
 
     if (command == "set-zero") {
@@ -271,328 +265,132 @@ int main(int argc, char** argv) {
             return 1;
         }
         if (!all_axes && target_axis.empty()) {
-            std::cerr << "[错误] 请指定标零目标: --axis <D18..D24> 或 --all\n";
+            std::cerr << "[错误] 请指定标零目标: --axis <AXIS> 或 --all\n";
             return 1;
         }
     }
 
-    if (command == "zero-torque") {
-        if (!confirmed) {
-            std::cerr << "[安全拦截] 请确认传感器处于所需零扭矩条件，并追加 --confirm。\n";
-            return 1;
-        }
-        if ((!all_axes && target_axis.empty()) || (all_axes && !target_axis.empty())) {
-            std::cerr << "[错误] zero-torque 必须且只能指定 --axis <Dxx|1..N> 或 --all。\n";
-            return 1;
-        }
-    }
-
-    if (command == "jog") {
+    if (command == "jog" || command == "jog-abs" || command == "zero") {
+        if (command == "jog-abs") jog_abs_flag = true;
+        std::size_t pos_idx = 0;
         if (target_axis.empty()) {
-            std::cerr << "[错误] 点动命令必须显式指定单个目标轴: --axis <D18..D24> (安全起见禁止全轴同时点动)\n";
-            return 1;
-        }
-        if (!has_delta_deg && !has_delta_count) {
-            has_delta_deg = true;
-            delta_deg = 1.0; // 默认微调 1 度
-        }
-    }
-
-    if (command == "backup-sii" && (alias_slave <= 0 || backup_path.empty())) {
-        std::cerr << "[错误] backup-sii 必须指定 --slave 和 --backup\n";
-        return 1;
-    }
-
-    if (command == "read-alias" && alias_slave <= 0) {
-        std::cerr << "[错误] read-alias 必须指定 --slave <1..N>\n";
-        return 1;
-    }
-
-    if (command == "write-alias") {
-        if (alias_slave <= 0 || alias_value <= 0 || alias_value > 65535 || backup_path.empty()) {
-            std::cerr << "[错误] write-alias 必须指定 --slave、--alias 和 --backup。\n";
-            return 1;
-        }
-        if (confirmation_phrase != "WRITE-EEPROM-ALIAS") {
-            std::cerr << "\n[安全拦截] 写 Alias 会永久修改电机 SII EEPROM。\n"
-                      << "           请核对物理拓扑并追加: --confirm WRITE-EEPROM-ALIAS\n\n";
-            return 1;
-        }
-    }
-
-    if (pdo_save && (command != "configure-pdo" || !confirmed)) {
-        std::cerr << "--save 仅用于 configure-pdo，且必须同时指定 --confirm 和备份路径\n";
-        return 1;
-    }
-    if (!pdo_slaves.empty() || !pdo_backup_dir.empty()) {
-        if (command != "configure-pdo" || pdo_slaves.empty() || alias_slave > 0 ||
-            !backup_path.empty() || (confirmed && pdo_backup_dir.empty())) {
-            std::cerr << "批量 PDO 使用 configure-pdo --slaves 2-8 [--confirm --backup-dir DIR]；不能混用 --slave/--backup\n";
-            return 1;
-        }
-    } else if (command == "configure-pdo" &&
-               (alias_slave <= 0 || (confirmed && backup_path.empty()))) {
-        std::cerr << "configure-pdo requires --slave; applying with --confirm also requires --backup\n";
-        return 1;
-    }
-
-    // A running PDO owner must never be rescanned by another CLI invocation.
-    std::string service_reply;
-    std::string read_request = "status";
-    if (command == "read-pos") read_request = "read-pos" + (target_axis.empty() ? std::string{} : " " + target_axis);
-    const int active_service = robot_maint::control_request(iface, read_request, service_reply, 2000);
-    if (active_service != 0) {
-        if (active_service > 0 && (command == "status" || command == "read-pos")) {
-            std::cout << service_reply;
-            return 0;
-        }
-        std::cerr << "[错误] " << (active_service < 0 ? service_reply :
-            "该网口已有后台 PDO 服务。点动请用 jog-enabled；其他维护操作前先 disable --all。") << '\n';
-        return 1;
-    }
-    robot_maint::InterfaceLock bus_lock;
-    if (!bus_lock.acquire(iface, service_reply)) {
-        std::cerr << "[错误] " << service_reply << '\n';
-        return 1;
-    }
-    robot_maint::MaintEngine engine(iface);
-    std::cout << "[INFO] 正在初始化以太网口: " << iface << " ...\n";
-    if (!engine.init()) {
-        return 1;
-    }
-
-    const int total_slaves = engine.slave_count();
-
-    if (command == "configure-pdo") {
-        if (pdo_slaves.empty()) pdo_slaves.push_back(alias_slave);
-        // 先对全部目标只读预检，避免发现后续无效目标时前面的电机已经写入。
-        for (int slave : pdo_slaves) {
-            std::string detail;
-            if (!engine.configure_tongchuan_pdo(slave, false, "", detail)) {
-                std::cerr << "[FAIL] slave " << slave << ": " << detail << '\n';
+            if (pos_idx >= positional.size()) {
+                std::cerr << "[错误] 请指定目标轴 (例如: " << command << " J7 ... 或 --axis J7)\n";
                 return 1;
             }
-            std::cout << "[CHECK] slave " << slave << ": " << detail << '\n';
+            target_axis = positional[pos_idx++];
         }
-        if (!confirmed) return 0;
-        if (!pdo_backup_dir.empty()) {
-            std::error_code error;
-            // 批次目录必须新建，防止重复执行时混入以前的备份。
-            if (!std::filesystem::create_directory(pdo_backup_dir, error)) {
-                std::cerr << "无法新建批次备份目录（父目录须存在，拒绝复用）: " << pdo_backup_dir
-                          << " " << error.message() << '\n';
-                return 1;
-            }
-        }
-        unsigned completed = 0;
-        for (int slave : pdo_slaves) {
-            const std::string path = pdo_backup_dir.empty() ? backup_path :
-                (std::filesystem::path(pdo_backup_dir) / ("slave" + std::to_string(slave) + "-pdo-before.txt")).string();
-            std::string detail;
-            const bool ok = engine.configure_tongchuan_pdo(slave, true, path, detail, pdo_save);
-            std::cout << (ok ? "[PASS]" : "[FAIL]") << " slave " << slave << ": " << detail << '\n';
-            if (!ok) {
-                std::cerr << "批次停止，已完成 " << completed << "/" << pdo_slaves.size()
-                          << "；此前成功的电机不自动回滚，后续电机未写入。\n";
-                return 1;
-            }
-            ++completed;
-        }
-        if (pdo_save) std::cout << "保存命令均已应答；断电保留仍需安全重新上电后只读验证。\n";
-        std::cout << "PDO batch PASS: " << completed << " slaves\n";
-        return 0;
-    }
-
-    // 1. STATUS
-    if (command == "status") {
-        const auto axes = engine.scan_all();
-        std::cout << "\n============================== EtherCAT 总线扫描结果 (共 " << axes.size() << " 个从站) ==============================\n";
-        std::cout << std::left
-                  << std::setw(6)  << "轴号"
-                  << std::setw(8)  << "从站ID"
-                  << std::setw(8)  << "Alias"
-                  << std::setw(20) << "电机厂商 (Vendor)"
-                  << std::setw(10) << "总线状态"
-                  << std::setw(24) << "CiA-402状态"
-                  << std::setw(10) << "故障代码"
-                  << std::setw(16) << "当前脉冲位置"
-                  << "故障描述\n";
-        std::cout << "------------------------------------------------------------------------------------------------------------\n";
-
-        for (const auto& a : axes) {
-            std::string code_str = "0x" + ([&]{
-                std::ostringstream ss;
-                ss << std::hex << std::setw(4) << std::setfill('0') << a.error_code;
-                return ss.str();
-            })();
-
-            std::cout << std::left
-                      << std::setw(6)  << a.axis_name
-                      << std::setw(8)  << a.slave_index
-                      << std::setw(8)  << a.station_alias
-                      << std::setw(20) << a.vendor_name
-                      << std::setw(10) << a.ethercat_state
-                      << std::setw(24) << a.cia402_state
-                      << std::setw(10) << code_str
-                      << std::setw(16) << a.actual_position
-                      << a.error_desc << "\n";
-        }
-        std::cout << "============================================================================================================\n\n";
-        return 0;
-    }
-
-    if (command == "read-alias") {
-        std::string detail;
-        const bool ok = engine.read_station_alias(alias_slave, detail);
-        std::cout << (ok ? "[成功] " : "[失败] ") << detail << '\n';
-        return ok ? 0 : 1;
-    }
-
-    if (command == "backup-sii") {
-        std::string detail;
-        const bool ok = engine.backup_station_eeprom(alias_slave, backup_path, detail);
-        std::cout << (ok ? "[成功] " : "[失败] ") << detail << '\n';
-        return ok ? 0 : 1;
-    }
-
-    // 2. WRITE-ALIAS（按扫描序号选设备，避免把 D 逻辑名误当成硬件身份）
-    if (command == "write-alias") {
-        if (alias_slave > total_slaves) {
-            std::cerr << "[错误] --slave 超出本次扫描范围 (1.." << total_slaves << ")\n";
-            return 1;
-        }
-        std::cout << "[WARN] 即将为物理从站 " << alias_slave << " 写入 EEPROM Alias "
-                  << alias_value << "，写入期间请勿断电。\n";
-        std::string detail;
-        const bool ok = engine.write_station_alias(
-            alias_slave, static_cast<std::uint16_t>(alias_value), backup_path, detail);
-        std::cout << (ok ? "[成功] " : "[失败] ") << detail << '\n';
-        return ok ? 0 : 1;
-    }
-
-    // 解析目标轴索引 (如用户未指定 --all)
-    int target_slave = -1;
-    if (!all_axes && !target_axis.empty()) {
-        target_slave = robot_maint::axis_name_to_slave(target_axis, total_slaves);
-        if (target_slave <= 0 || target_slave > total_slaves) {
-            std::cerr << "[错误] 无法识别指定轴或从站超出总线范围: " << target_axis
-                      << " (当前总线从站总数: " << total_slaves << ")\n";
-            return 1;
-        }
-    }
-
-    // 2. CLEAR-FAULT
-    if (command == "clear-fault") {
-        std::cout << "[INFO] 开始执行清错操作...\n";
-        bool all_success = true;
-
-        for (int i = 1; i <= total_slaves; ++i) {
-            const std::string name = robot_maint::slave_to_axis_name(i, total_slaves);
-            if (all_axes || i == target_slave) {
-                std::string detail;
-                const bool ok = engine.clear_fault(i, detail);
-                std::cout << "  - [" << name << "] 从站 " << i << ": " << (ok ? "[成功] " : "[失败] ") << detail << "\n";
-                if (!ok) all_success = false;
-            }
-        }
-        return all_success ? 0 : 1;
-    }
-
-    // 3. SET-ZERO
-    if (command == "set-zero") {
-        std::cout << "[WARN] 正在执行零点标定写入...\n";
-        bool all_success = true;
-
-        for (int i = 1; i <= total_slaves; ++i) {
-            const std::string name = robot_maint::slave_to_axis_name(i, total_slaves);
-            if (all_axes || i == target_slave) {
-                std::string detail;
-                const bool ok = engine.set_zero(i, detail);
-                std::cout << "  - [" << name << "] 从站 " << i << ": " << (ok ? "[标定成功] " : "[标定失败] ") << detail << "\n";
-                if (!ok) all_success = false;
-            }
-        }
-        return all_success ? 0 : 1;
-    }
-
-    if (command == "zero-torque") {
-        std::cout << "[INFO] 正在发送同川扭矩传感器清零命令...\n";
-        bool all_success = true;
-        for (int i = 1; i <= total_slaves; ++i) {
-            if (all_axes || i == target_slave) {
-                std::string detail;
-                const bool ok = engine.zero_torque(i, detail);
-                std::cout << "  - [" << robot_maint::slave_to_axis_name(i, total_slaves)
-                          << "] 从站 " << i << ": " << (ok ? "[写入成功] " : "[失败] ") << detail << "\n";
-                if (!ok) all_success = false;
-            }
-        }
-        return all_success ? 0 : 1;
-    }
-
-    // 4. READ-POS
-    if (command == "read-pos") {
-        if (!all_axes && target_axis.empty()) all_axes = true; // 默认读全轴
-
-        std::cout << "\n--- 当前各轴绝对位置脉冲 ---\n";
-        for (int i = 1; i <= total_slaves; ++i) {
-            const std::string name = robot_maint::slave_to_axis_name(i, total_slaves);
-            if (all_axes || i == target_slave) {
-                int32_t pos = 0;
-                if (engine.read_position(i, pos)) {
-                    std::cout << "  " << name << " (从站 " << i << "): " << pos << " counts\n";
-                } else {
-                    std::cout << "  " << name << " (从站 " << i << "): 读取失败\n";
+        if (command != "zero" && !has_jog_deg) {
+            if (pos_idx < positional.size()) {
+                if (!parse_double(positional[pos_idx++], jog_deg)) {
+                    std::cerr << "[错误] 无效的旋转角度: " << positional[pos_idx - 1] << '\n';
+                    return 1;
                 }
+            } else {
+                jog_deg = jog_abs_flag ? 0.0 : 1.0;
             }
         }
-        std::cout << "---------------------------\n\n";
+        if (jog_ms < 0) {
+            if (pos_idx < positional.size()) {
+                if (!parse_positive_int(positional[pos_idx++], jog_ms)) {
+                    std::cerr << "[错误] 无效的运动时长(ms): " << positional[pos_idx - 1] << '\n';
+                    return 1;
+                }
+            } else {
+                jog_ms = (command == "zero") ? 5000 : (jog_abs_flag ? 4000 : 3000);
+            }
+        }
+    }
+
+    robot_maint::ArmController controller(iface);
+
+    if (command == "rpc") {
+        return robot_maint::run_rpc_session(controller);
+    }
+
+    std::cout << "[INFO] 网口: " << iface << " | 指令: " << command << "\n";
+    if (!controller.init_bus()) {
+        return 1;
+    }
+    const int total_slaves = controller.slave_count();
+
+    auto resolve_single_axis = [&](const std::string& label) -> int {
+        const int s = robot_maint::axis_name_to_slave(label, total_slaves);
+        if (s < 1 || s > total_slaves) {
+            std::cerr << "[错误] 无法识别指定轴或从站超出总线范围: " << label
+                      << " (当前总线从站总数: " << total_slaves << ")\n";
+            return -1;
+        }
+        return s;
+    };
+
+    if (command == "status") {
+        const auto list = controller.scan_status(detailed);
+        controller.print_status_table(list, detailed);
         return 0;
     }
 
     if (command == "read-sdo") {
+        int target_slave = -1;
         if (!all_axes && target_axis.empty()) all_axes = true;
-        bool all_success = true;
+        if (!all_axes) {
+            target_slave = resolve_single_axis(target_axis);
+            if (target_slave < 0) return 1;
+        }
+        bool all_ok = true;
         for (int i = 1; i <= total_slaves; ++i) {
             if (!all_axes && i != target_slave) continue;
-            std::vector<std::uint8_t> value;
-            const std::string name = robot_maint::slave_to_axis_name(i, total_slaves);
+            std::vector<std::uint8_t> bytes;
+            const std::string& name = controller.axes()[i - 1].axis_name;
             std::cout << name << " (从站 " << i << ") 0x"
                       << std::hex << std::setw(4) << std::setfill('0') << sdo_index
                       << ":" << std::setw(2) << sdo_subindex << std::dec << ": ";
-            if (engine.read_sdo_bytes(i, static_cast<std::uint16_t>(sdo_index),
-                                      static_cast<std::uint8_t>(sdo_subindex), value)) {
-                std::cout << format_sdo_value(value) << '\n';
+            if (controller.bus().read_sdo_bytes(i, static_cast<std::uint16_t>(sdo_index),
+                                                static_cast<std::uint8_t>(sdo_subindex), bytes)) {
+                std::cout << format_sdo_value(bytes) << '\n';
             } else {
-                std::cout << "读取失败（对象不存在、从站不支持 CoE、响应超时或数据超过 256 字节）\n";
-                all_success = false;
+                std::cout << "读取失败（对象不存在、不支持 CoE 或超时）\n";
+                all_ok = false;
             }
         }
-        return all_success ? 0 : 1;
+        return all_ok ? 0 : 1;
     }
 
-    // 5. JOG
-    if (command == "jog") {
-        if (target_slave <= 0 || target_slave > total_slaves) {
-            std::cerr << "[错误] 无效的轴名称或从站超出范围: " << target_axis
-                      << " (当前总线从站数: " << total_slaves << ")\n";
-            return 1;
+    if (command == "write-sdo") {
+        const int target_slave = resolve_single_axis(target_axis);
+        if (target_slave < 0) return 1;
+        if (controller.bus().write_sdo_bytes(target_slave, static_cast<std::uint16_t>(sdo_index),
+                                             static_cast<std::uint8_t>(sdo_subindex), write_sdo_payload)) {
+            std::cout << "[成功] 已写入从站 " << target_slave << " 0x"
+                      << std::hex << sdo_index << ":" << sdo_subindex << std::dec << '\n';
+            return 0;
         }
-
-        std::string name = robot_maint::slave_to_axis_name(target_slave, total_slaves);
-        std::cout << "[INFO] 准备执行点动微调: " << name << " (从站 " << target_slave << ") ...\n";
-        std::string detail;
-        bool ok = false;
-        if (has_delta_count) {
-            ok = engine.jog_axis_counts(target_slave, delta_count, speed_rpm, detail);
-        } else {
-            ok = engine.jog_axis_deg(target_slave, delta_deg, speed_rpm, detail);
-        }
-
-        std::cout << (ok ? "  [JOG 成功] " : "  [JOG 失败] ") << detail << "\n\n";
-        return ok ? 0 : 1;
+        std::cerr << "[失败] SDO 写入失败: " << controller.bus().pop_coe_errors() << '\n';
+        return 1;
     }
 
-    std::cerr << "[错误] 未知命令: " << command << "，输入 --help 查看支持命令。\n";
-    return 1;
+    if (command == "set-zero") {
+        int target_slave = -1;
+        if (!all_axes) {
+            target_slave = resolve_single_axis(target_axis);
+            if (target_slave < 0) return 1;
+        }
+        bool all_ok = true;
+        for (int i = 1; i <= total_slaves; ++i) {
+            if (!all_axes && i != target_slave) continue;
+            if (!controller.axes()[i - 1].is_servo) continue;
+            std::string detail;
+            const bool ok = controller.set_zero(i, detail);
+            std::cout << "  - [" << controller.axes()[i - 1].axis_name << "] 从站 " << i << ": "
+                      << (ok ? "[标定成功] " : "[标定失败] ") << detail << "\n";
+            if (!ok) all_ok = false;
+        }
+        return all_ok ? 0 : 1;
+    }
+
+    const int slave = resolve_single_axis(target_axis);
+    if (slave < 0) return 1;
+    if (command == "zero") return controller.run_zero(slave, jog_ms) ? 0 : 1;
+    if (jog_abs_flag) return controller.run_jog_abs(slave, jog_deg, jog_ms) ? 0 : 1;
+    return controller.run_jog(slave, jog_deg, jog_ms) ? 0 : 1;
 }

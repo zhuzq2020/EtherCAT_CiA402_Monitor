@@ -5,7 +5,6 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_C_STANDARD 99)
 
-# 编译优化
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE RelWithDebInfo)
 endif()
@@ -28,9 +27,7 @@ set(SOEM_SOURCES
     "${SOEM_DIR}/oshw/linux/oshw.c"
 )
 
-# 静态库目标
 add_library(soem_static STATIC ${SOEM_SOURCES})
-
 target_include_directories(soem_static PUBLIC
     "${SOEM_DIR}/include"
     "${SOEM_DIR}/osal"
@@ -38,31 +35,33 @@ target_include_directories(soem_static PUBLIC
     "${SOEM_DIR}/oshw/linux"
 )
 
-# 编译单一二进制维护工具
-add_executable(arm_maint
-    src/main.cpp
-    src/maint_engine.cpp
-    src/eeprom_access.cpp
-    src/motion_control.cpp
-    src/persistent_bus.cpp
+# 通用机械臂 EtherCAT (SOEM) 控制 SDK 核心库
+add_library(arm_soem_sdk STATIC
+    src/soem_bus.cpp
+    src/drive_profile.cpp
+    src/arm_controller.cpp
     src/pdo_exchange.cpp
-    src/control_service.cpp
+    src/eeprom_access.cpp
+    src/rpc_session.cpp
 )
-
-target_include_directories(arm_maint PRIVATE
+target_include_directories(arm_soem_sdk PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
-    "${SOEM_DIR}/include"
-    "${SOEM_DIR}/osal"
-    "${SOEM_DIR}/osal/linux"
-    "${SOEM_DIR}/oshw/linux"
 )
-
-target_link_libraries(arm_maint PRIVATE
+target_link_libraries(arm_soem_sdk PUBLIC
     soem_static
     pthread
 )
+target_compile_options(arm_soem_sdk PRIVATE -Wall -Wextra -Werror)
 
-# 安装规则
+# 底层维护与实时控制可执行文件
+add_executable(arm_maint
+    src/main.cpp
+)
+target_link_libraries(arm_maint PRIVATE
+    arm_soem_sdk
+)
+target_compile_options(arm_maint PRIVATE -Wall -Wextra -Werror)
+
 install(TARGETS arm_maint DESTINATION bin)
 
 include(CTest)
@@ -74,35 +73,32 @@ if(BUILD_TESTING)
         -Wl,--wrap=ecx_getindex -Wl,--wrap=ecx_setbufstat
         -Wl,--wrap=ecx_outframe_red -Wl,--wrap=ecx_waitinframe)
     add_test(NAME pdo_exchange COMMAND pdo_exchange_test)
+
     add_executable(motion_pdo_group_test tests/motion_pdo_group_test.cpp)
     target_include_directories(motion_pdo_group_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
     target_link_libraries(motion_pdo_group_test PRIVATE soem_static)
     add_test(NAME motion_pdo_group COMMAND motion_pdo_group_test)
-    add_executable(csp_mode_test tests/csp_mode_test.cpp src/motion_control.cpp)
+
+    add_executable(csp_mode_test tests/csp_mode_test.cpp)
     target_include_directories(csp_mode_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
     add_test(NAME csp_mode COMMAND csp_mode_test)
-    add_executable(motion_control_test tests/motion_control_test.cpp src/motion_control.cpp)
-    target_include_directories(motion_control_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
-    add_test(NAME motion_control COMMAND motion_control_test)
-    find_package(Python3 QUIET COMPONENTS Interpreter)
-    if(Python3_Interpreter_FOUND)
-        add_executable(control_lifecycle_mock tests/control_lifecycle_mock.cpp src/control_service.cpp src/motion_control.cpp)
-        target_include_directories(control_lifecycle_mock PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
-        target_link_libraries(control_lifecycle_mock PRIVATE soem_static pthread)
-        add_test(NAME control_lifecycle COMMAND "${Python3_EXECUTABLE}"
-            "${CMAKE_CURRENT_SOURCE_DIR}/tests/control_lifecycle_test.py" "$<TARGET_FILE:control_lifecycle_mock>")
-        add_test(NAME control_cli COMMAND "${Python3_EXECUTABLE}"
-            "${CMAKE_CURRENT_SOURCE_DIR}/tests/control_cli_test.py" "$<TARGET_FILE:arm_maint>")
-        add_test(NAME zero_torque_cli COMMAND "${Python3_EXECUTABLE}"
-            "${CMAKE_CURRENT_SOURCE_DIR}/tests/zero_torque_cli_test.py" "$<TARGET_FILE:arm_maint>")
-        add_test(NAME alias_cli COMMAND "${Python3_EXECUTABLE}"
-            "${CMAKE_CURRENT_SOURCE_DIR}/tests/alias_cli_test.py" "$<TARGET_FILE:arm_maint>")
-    endif()
+
+    add_executable(sdk_core_test tests/sdk_core_test.cpp)
+    target_link_libraries(sdk_core_test PRIVATE arm_soem_sdk)
+    add_test(NAME sdk_core COMMAND sdk_core_test)
+
     add_executable(sii_integrity_test tests/sii_integrity_test.cpp)
     target_include_directories(sii_integrity_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
     add_test(NAME sii_integrity COMMAND sii_integrity_test)
+
     add_executable(eeprom_access_test tests/eeprom_access_test.cpp src/eeprom_access.cpp)
     target_include_directories(eeprom_access_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
     target_compile_options(eeprom_access_test PRIVATE -Wall -Wextra -Wpedantic -Werror)
     add_test(NAME eeprom_access COMMAND eeprom_access_test)
+
+    find_package(Python3 QUIET COMPONENTS Interpreter)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME python_workflows_cli COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/alias_cli_test.py" "$<TARGET_FILE:arm_maint>")
+    endif()
 endif()

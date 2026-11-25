@@ -2,4 +2,6 @@
 /build-core/
 /.deps/
 /.cache/
+__pycache__/
+*.pyc
 *.user

@@ -1,0 +1,11 @@
+{
+  "vendor_id": "0x00075500",
+  "vendor_name": "同川 (Tongchuan)",
+  "driver_type": "tongchuan",
+  "fixed_csp_mode": false,
+  "supports_set_zero": true,
+  "zeroing_method": "sdo_3801_val5",
+  "default_encoder_lines": 131072,
+  "default_gear_ratio": 101,
+  "axis_defaults": []
+}

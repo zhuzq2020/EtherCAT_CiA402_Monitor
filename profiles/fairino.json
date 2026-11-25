@@ -1,0 +1,18 @@
+{
+  "vendor_id": "0x00000CA0",
+  "vendor_name": "法奥 (Fairino)",
+  "driver_type": "fairino",
+  "fixed_csp_mode": true,
+  "supports_set_zero": true,
+  "zeroing_method": "controlword_bit13",
+  "default_encoder_lines": 16384,
+  "axis_defaults": [
+    { "joint": 1, "model": "ART-70-100-M", "gear_ratio": 100, "counts_per_rev": 1654784 },
+    { "joint": 2, "model": "ART-70-100-M", "gear_ratio": 100, "counts_per_rev": 1654784 },
+    { "joint": 3, "model": "ART-70-80-M",  "gear_ratio": 120, "counts_per_rev": 1982464 },
+    { "joint": 4, "model": "ART-70-80-M",  "gear_ratio": 120, "counts_per_rev": 1982464 },
+    { "joint": 5, "model": "ART-70-50-M",  "gear_ratio": 100, "counts_per_rev": 1654784 },
+    { "joint": 6, "model": "ART-70-50-M",  "gear_ratio": 100, "counts_per_rev": 1654784 },
+    { "joint": 7, "model": "ART-70-50-M",  "gear_ratio": 100, "counts_per_rev": 1654784 }
+  ]
+}

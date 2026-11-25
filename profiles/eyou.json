@@ -1,0 +1,11 @@
+{
+  "vendor_id": "0x00001097",
+  "vendor_name": "意优 (Eyou)",
+  "driver_type": "eyou",
+  "fixed_csp_mode": false,
+  "supports_set_zero": true,
+  "zeroing_method": "homing_6060_flash",
+  "default_encoder_lines": 131072,
+  "default_gear_ratio": 121,
+  "axis_defaults": []
+}
